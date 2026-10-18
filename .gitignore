@@ -1,0 +1,20 @@
+node_modules/
+coverage/
+dist/
+*.log
+*.tsbuildinfo
+
+# Segredos e configuração local — nunca versionar
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json

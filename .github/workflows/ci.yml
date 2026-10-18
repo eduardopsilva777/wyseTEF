@@ -1,0 +1,42 @@
+# Validação contínua. Definido na F1, mas ainda NÃO executado (não há repositório remoto).
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ${{ github.run_id }}-ci-only
+          POSTGRES_DB: tef_ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ci -d tef_ci" --health-interval 2s --health-timeout 3s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - name: Testes de integração (PostgreSQL)
+        run: npm run test:db
+        env:
+          TEST_DATABASE_URL: postgres://ci:${{ github.run_id }}-ci-only@127.0.0.1:5432/tef_ci
+      - run: npm run check:secrets
+      - run: npm run check:deps
+      # Recomendado antes do piloto: gitleaks (histórico completo) e SAST dedicado.

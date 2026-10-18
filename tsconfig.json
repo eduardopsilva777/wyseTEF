@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.base.json",
+  "include": [
+    "apps/*/src/**/*.ts",
+    "apps/*/test/**/*.ts",
+    "packages/**/src/**/*.ts",
+    "packages/**/test/**/*.ts",
+    "tests/**/*.ts",
+    "vitest.config.ts",
+    "eslint.config.js"
+  ],
+  "exclude": ["**/node_modules/**"],
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": false
+  }
+}

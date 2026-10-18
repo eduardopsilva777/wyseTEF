@@ -1,0 +1,13 @@
+{
+  "name": "@tef/provider-contract",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./conformance": "./src/conformance.ts"
+  },
+  "dependencies": {
+    "@tef/domain": "0.0.0"
+  }
+}

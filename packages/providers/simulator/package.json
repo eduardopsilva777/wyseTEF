@@ -1,0 +1,13 @@
+{
+  "name": "@tef/provider-simulator",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@tef/domain": "0.0.0",
+    "@tef/provider-contract": "0.0.0"
+  }
+}
