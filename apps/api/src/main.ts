@@ -1,8 +1,9 @@
-import { PaymentService, type UnitOfWork } from '@tef/application';
+import { AdminService, PaymentService, type UnitOfWork } from '@tef/application';
 import { InMemoryUnitOfWork } from '@tef/persistence/memory';
 import { createPgPool, PgUnitOfWork } from '@tef/persistence/postgres';
 import { createProviderRegistry } from '@tef/provider-contract';
 import { PaymentSimulator, SIMULATOR_PROVIDER_ID } from '@tef/provider-simulator';
+import { DevAdminAuth } from './admin-auth.ts';
 import { buildApp } from './app.ts';
 import { createAuthenticator } from './auth.ts';
 import { ConfigError, loadConfig } from './config.ts';
@@ -27,33 +28,38 @@ if (config.TEF_PERSISTENCE === 'postgres' && config.DATABASE_URL) {
   uow = new PgUnitOfWork(pool);
   closeDb = () => pool.end();
 } else {
-  logger.warn({}, 'persistência EM MEMÓRIA: dados são perdidos ao reiniciar (somente desenvolvimento)');
+  logger.warn({}, 'persistência EM MEMÓRIA: dados são perdidos ao reiniciar e não há worker (somente desenvolvimento)');
   uow = new InMemoryUnitOfWork();
 }
 
-const simulator = new PaymentSimulator();
+// A API não executa operações: só as aceita (202). O worker (apps/worker) as processa.
+// O simulador é registrado aqui apenas para expor identidade e capacidades.
+const providers = createProviderRegistry([new PaymentSimulator()]);
 logger.warn({ providerId: SIMULATOR_PROVIDER_ID }, 'provedor SIMULADOR ativo: nenhuma transação é real');
-const providers = createProviderRegistry([simulator]);
 
 const service = new PaymentService({ uow, providers, providerTimeoutMs: config.TEF_PROVIDER_TIMEOUT_MS, logger });
 
-simulator.onNotification((notification) => {
-  service.handleProviderNotification(notification).catch((error: unknown) => {
-    logger.warn({ err: error, operationId: notification.clientReference }, 'falha ao processar notificação do simulador');
-  });
-});
+const admin = config.TEF_DEV_ADMIN_TOKEN_SHA256
+  ? {
+      auth: new DevAdminAuth({ tokenSha256: config.TEF_DEV_ADMIN_TOKEN_SHA256 }),
+      service: new AdminService({ uow, providers }),
+      allowedOrigins: config.TEF_ADMIN_ALLOWED_ORIGINS,
+    }
+  : undefined;
+if (admin) {
+  logger.warn({ mode: 'DEV_LOCAL_ADMIN' }, 'painel administrativo LOCAL habilitado (somente desenvolvimento; não é autenticação de produção)');
+}
 
 const app = buildApp({
   service,
   providers,
-  defaultProviderId: SIMULATOR_PROVIDER_ID,
   authenticate: createAuthenticator(config.TEF_API_CREDENTIALS),
   logger,
+  ...(admin ? { admin } : {}),
 });
 
 const shutdown = async (signal: string): Promise<void> => {
   logger.info({ signal }, 'encerrando');
-  simulator.dispose();
   await app.close();
   await closeDb();
 };

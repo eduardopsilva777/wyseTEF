@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { money, newOperationId, newPaymentId, parseTerminalId, type OperationKind } from '@tef/domain';
+import { money, newOperationId, newPaymentId, parseTerminalId, uuidv7Timestamp, type OperationKind } from '@tef/domain';
 import type { ProviderNotification, ProviderOperationRequest } from '@tef/provider-contract';
 import { runProviderConformanceSuite } from '@tef/provider-contract/conformance';
 import {
   DEFAULT_SIMULATOR_CAPABILITIES,
+  InMemorySimulatorLedger,
   PaymentSimulator,
   SimulatedCommunicationError,
   type SimulatorScenario,
@@ -158,5 +159,24 @@ describe('simulador: cenários controlados', () => {
     expect((await sim.execute(request('AUTHORIZATION', 1_053), signal())).status).toBe('NOT_SENT');
     expect((await sim.execute(request('AUTHORIZATION', 1_058), signal())).status).toBe('UNKNOWN');
     expect((await sim.execute(request('REFUND', 1_051), signal())).status).toBe('SUCCEEDED');
+  });
+});
+
+describe('simulador: autoridade do livro', () => {
+  it('extrai o instante de criação do identificador UUIDv7', () => {
+    const before = Date.now();
+    const id = newOperationId();
+    const ts = uuidv7Timestamp(id);
+    expect(ts).not.toBeNull();
+    expect(ts!).toBeGreaterThanOrEqual(before);
+    expect(ts!).toBeLessThanOrEqual(Date.now());
+    expect(uuidv7Timestamp('nao-e-uuid')).toBeNull();
+  });
+
+  it('operação anterior ao livro: consulta indisponível, nunca "não encontrado"', async () => {
+    const legacy = request();
+    const sim = new PaymentSimulator({ ledger: new InMemorySimulatorLedger(Date.now() + 60_000) });
+    const result = await sim.query!({ kind: 'AUTHORIZATION', clientReference: legacy.clientReference, terminalId: legacy.terminalId }, new AbortController().signal);
+    expect(result).toEqual({ status: 'UNAVAILABLE', resultCode: 'SIM_LEDGER_NOT_AUTHORITATIVE' });
   });
 });

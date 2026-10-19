@@ -8,6 +8,7 @@ import {
   EvidenceRequiredError,
   FINAL_OPERATION_STATUSES,
   markDispatched,
+  newPaymentId,
   planOperation,
   type Evidence,
   type ManualResolution,
@@ -21,6 +22,7 @@ import {
   type PaymentId,
   type ProviderId,
   type TenantId,
+  type Terminal,
   type TerminalId,
 } from '@tef/domain';
 import type {
@@ -32,12 +34,15 @@ import type {
 import {
   IdempotencyConflictError,
   NotFoundError,
+  NothingToReconcileError,
   ProviderMismatchError,
   ReconciliationRequiresManualActionError,
+  ReferenceInvalidError,
+  TestDirectiveNotAllowedError,
 } from './errors.ts';
 import { DEFAULT_IDEMPOTENCY_TTL_MS, requestHash } from './idempotency.ts';
 import { INVALID_PROVIDER_CODE, safeProviderCode, safeProviderReference } from './provider-output.ts';
-import { NOOP_LOGGER, type AppLogger, type IdempotencyRecord, type Repositories, type UnitOfWork } from './ports.ts';
+import { NOOP_LOGGER, type AppLogger, type IdempotencyRecord, type Job, type Repositories, type UnitOfWork } from './ports.ts';
 
 export interface Actor {
   readonly type: ActorType;
@@ -55,7 +60,12 @@ export interface CreatePaymentCommand {
   readonly terminalId: TerminalId;
   readonly externalReference: string;
   readonly amount: Money;
-  readonly providerId: ProviderId;
+  /** Opcional: o provedor vem do terminal; se informado, precisa coincidir. */
+  readonly providerId?: ProviderId;
+  /** Enfileira a autorização na mesma transação (processamento assíncrono). */
+  readonly authorize?: boolean;
+  /** Cenário de teste do SIMULATOR (dado fictício). Recusado para outros provedores. */
+  readonly testDirective?: string;
 }
 
 export interface PaymentView {
@@ -85,7 +95,19 @@ export interface PaymentServiceDeps {
   readonly clock?: () => Date;
   readonly idempotencyTtlMs?: number;
   readonly logger?: AppLogger;
+  /** Máximo de tentativas de uma tarefa de execução antes de FAILED. */
+  readonly jobMaxAttempts?: number;
+  /** Atraso inicial e máximo de tentativas da reconciliação automática por consulta. */
+  readonly reconcileDelayMs?: number;
+  readonly reconcileMaxAttempts?: number;
 }
+
+/** Resultado do processamento de uma tarefa pelo worker. */
+export type JobOutcome =
+  | { readonly kind: 'DONE'; readonly detail: string }
+  /** O worker perdeu a posse da tarefa: nada foi feito; o dono atual a processa. */
+  | { readonly kind: 'LOST_LEASE' }
+  | { readonly kind: 'RETRY'; readonly availableAt: Date; readonly errorCode: string };
 
 const SYSTEM_RECONCILER: Actor = { type: 'SYSTEM', id: 'reconciler' };
 const SYSTEM_RECOVERY: Actor = { type: 'SYSTEM', id: 'recovery' };
@@ -105,6 +127,9 @@ export class PaymentService {
   private readonly clock: () => Date;
   private readonly idempotencyTtlMs: number;
   private readonly logger: AppLogger;
+  private readonly jobMaxAttempts: number;
+  private readonly reconcileDelayMs: number;
+  private readonly reconcileMaxAttempts: number;
 
   constructor(deps: PaymentServiceDeps) {
     this.uow = deps.uow;
@@ -113,6 +138,14 @@ export class PaymentService {
     this.clock = deps.clock ?? (() => new Date());
     this.idempotencyTtlMs = deps.idempotencyTtlMs ?? DEFAULT_IDEMPOTENCY_TTL_MS;
     this.logger = deps.logger ?? NOOP_LOGGER;
+    this.jobMaxAttempts = deps.jobMaxAttempts ?? 5;
+    this.reconcileDelayMs = deps.reconcileDelayMs ?? 2_000;
+    this.reconcileMaxAttempts = deps.reconcileMaxAttempts ?? 10;
+  }
+
+  /** Limite de tempo da chamada ao provedor (o worker exige lease maior que isso). */
+  get providerCallTimeoutMs(): number {
+    return this.providerTimeoutMs;
   }
 
   // -------------------------------------------------------------------------
@@ -131,24 +164,31 @@ export class PaymentService {
   // Criação (sem contato com o provedor)
   // -------------------------------------------------------------------------
 
+  /**
+   * Cria a intenção de cobrança. Com `authorize: true`, a autorização é registrada
+   * (operação PENDING) e a tarefa durável é enfileirada NA MESMA TRANSAÇÃO: não há
+   * janela em que o pagamento exista sem a tarefa que o processará.
+   */
   async createPayment(ctx: RequestContext, command: CreatePaymentCommand, idempotencyKey: string): Promise<CommandResult> {
     const now = this.clock();
     const scope = 'payments.create';
+    const authorize = command.authorize ?? false;
     const hash = requestHash(scope, {
       merchantId: command.merchantId,
       terminalId: command.terminalId,
       externalReference: command.externalReference,
       amountCents: command.amount.cents,
       currency: command.amount.currency,
-      providerId: command.providerId,
+      providerId: command.providerId ?? null,
+      authorize,
+      testDirective: command.testDirective ?? null,
     });
-    // Garante que o provedor existe antes de gravar qualquer coisa.
-    this.providers.get(command.providerId);
-    const candidate = createPayment({ tenantId: ctx.tenantId, ...command }, now);
+    const paymentId = newPaymentId();
+    const status = authorize ? 202 : 201;
 
     return this.uow.transaction(async (repos) => {
       const claim = await repos.idempotency.claim(
-        this.idempotencyRecord(ctx, command.merchantId, scope, idempotencyKey, hash, 'payment', candidate.id, 201, now),
+        this.idempotencyRecord(ctx, command.merchantId, scope, idempotencyKey, hash, 'payment', paymentId, status, now),
       );
       if (!claim.claimed) {
         const existing = this.assertSameRequest(claim.existing, hash);
@@ -162,18 +202,102 @@ export class PaymentService {
         };
       }
 
-      await repos.payments.insert(candidate);
-      await this.audit(repos, ctx, 'payment.created', 'payment', candidate.id, now, {
-        toState: candidate.state,
-        amountCents: candidate.amount.cents,
-        currency: candidate.amount.currency,
-        merchantId: candidate.merchantId,
-        terminalId: candidate.terminalId,
-        externalReference: candidate.externalReference,
-        providerId: candidate.providerId,
+      const terminal = await this.resolveTerminal(repos, ctx.tenantId, command.merchantId, command.terminalId);
+      if (command.providerId && command.providerId !== terminal.providerId) {
+        throw new ReferenceInvalidError('o provedor informado não corresponde ao configurado no terminal');
+      }
+      const provider = this.providers.get(terminal.providerId);
+      if (command.testDirective !== undefined && provider.kind !== 'SIMULATOR') {
+        throw new TestDirectiveNotAllowedError('diretivas de teste só são aceitas pelo provedor SIMULATOR');
+      }
+
+      const created = createPayment(
+        {
+          id: paymentId,
+          tenantId: ctx.tenantId,
+          merchantId: command.merchantId,
+          terminalId: command.terminalId,
+          externalReference: command.externalReference,
+          providerId: terminal.providerId,
+          amount: command.amount,
+        },
+        now,
+      );
+      const planned = authorize
+        ? planOperation({ payment: created, operations: [], kind: 'AUTHORIZATION', capabilities: provider.capabilities, now })
+        : null;
+      const toInsert = planned ? planned.payment : created;
+
+      await repos.payments.insert(toInsert);
+      await this.audit(repos, ctx, 'payment.created', 'payment', created.id, now, {
+        toState: created.state,
+        amountCents: created.amount.cents,
+        currency: created.amount.currency,
+        merchantId: created.merchantId,
+        terminalId: created.terminalId,
+        externalReference: created.externalReference,
+        providerId: created.providerId,
+        providerKind: provider.kind,
+        testDirective: command.testDirective ?? null,
       });
-      await this.emit(repos, candidate, 'payment.created', now);
-      return { payment: candidate, operations: [], replayed: false, responseStatus: 201 };
+      await this.emit(repos, created, 'payment.created', now);
+      if (command.testDirective !== undefined) {
+        await repos.testDirectives.set(created.id, created.providerId, command.testDirective, now);
+      }
+
+      if (!planned) return { payment: created, operations: [], replayed: false, responseStatus: status };
+
+      await this.auditPaymentTransition(repos, ctx, created, planned.payment, now);
+      await this.emit(repos, planned.payment, 'payment.state_changed', now);
+      await this.persistRequestedOperation(repos, ctx, planned.payment, planned.operation, provider, now);
+      return { payment: planned.payment, operations: [planned.operation], replayed: false, responseStatus: status };
+    });
+  }
+
+  /** O terminal precisa existir, estar ativo e pertencer a um estabelecimento ativo de um cliente ativo. */
+  private async resolveTerminal(repos: Repositories, tenantId: TenantId, merchantId: MerchantId, terminalId: TerminalId): Promise<Terminal> {
+    const customer = await repos.catalog.findCustomer(tenantId);
+    const merchant = await repos.catalog.findMerchant(tenantId, merchantId);
+    const terminal = await repos.catalog.findTerminal(tenantId, terminalId);
+    if (
+      customer?.status !== 'ACTIVE' ||
+      merchant?.status !== 'ACTIVE' ||
+      terminal?.status !== 'ACTIVE' ||
+      terminal.merchantId !== merchantId
+    ) {
+      throw new ReferenceInvalidError('estabelecimento ou terminal inexistente, inativo ou não pertencente ao cliente');
+    }
+    return terminal;
+  }
+
+  /** Grava a operação PENDING, enfileira a tarefa que a executará e audita (mesma transação). */
+  private async persistRequestedOperation(
+    repos: Repositories,
+    ctx: RequestContext,
+    payment: Payment,
+    operation: Operation,
+    provider: PaymentProvider,
+    now: Date,
+  ): Promise<void> {
+    await repos.operations.insert(operation);
+    await repos.jobs.enqueue(
+      {
+        kind: 'EXECUTE_OPERATION',
+        tenantId: payment.tenantId,
+        paymentId: payment.id,
+        operationId: operation.id,
+        availableAt: now,
+        maxAttempts: this.jobMaxAttempts,
+      },
+      now,
+    );
+    await this.audit(repos, ctx, 'operation.requested', 'operation', operation.id, now, {
+      operationKind: operation.kind,
+      operationStatus: operation.status,
+      amountCents: operation.amount.cents,
+      providerId: payment.providerId,
+      providerKind: provider.kind,
+      jobKind: 'EXECUTE_OPERATION',
     });
   }
 
@@ -213,6 +337,184 @@ export class PaymentService {
 
   refund(ctx: RequestContext, paymentId: PaymentId, amount: Money, idempotencyKey: string): Promise<OperationCommandResult> {
     return this.executeOperation(ctx, paymentId, 'REFUND', amount, idempotencyKey);
+  }
+
+  // -------------------------------------------------------------------------
+  // Modelo assíncrono: solicitação (API) + execução (worker)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Aceita uma operação para processamento assíncrono: valida as regras do domínio,
+   * grava a operação PENDING e a tarefa durável na mesma transação (HTTP 202).
+   * Nada é enviado ao provedor aqui.
+   */
+  async requestOperation(
+    ctx: RequestContext,
+    paymentId: PaymentId,
+    kind: OperationKind,
+    amount: Money | undefined,
+    idempotencyKey: string,
+  ): Promise<OperationCommandResult> {
+    const now = this.clock();
+    const scope = `payments.operation.${kind}`;
+    const hash = requestHash(scope, { paymentId, amountCents: amount?.cents ?? null, currency: amount?.currency ?? null });
+
+    return this.uow.transaction(async (repos) => {
+      const payment = await this.lockPayment(repos, ctx.tenantId, paymentId);
+      const provider = this.providers.get(payment.providerId);
+      const operations = await repos.operations.listByPayment(ctx.tenantId, paymentId);
+      const planned = (() => {
+        try {
+          return {
+            ok: true as const,
+            value: planOperation({ payment, operations, kind, ...(amount ? { amount } : {}), capabilities: provider.capabilities, now }),
+          };
+        } catch (error) {
+          return { ok: false as const, error };
+        }
+      })();
+
+      const claim = await repos.idempotency.claim(
+        this.idempotencyRecord(ctx, payment.merchantId, scope, idempotencyKey, hash, 'operation', planned.ok ? planned.value.operation.id : 'rejected', 202, now),
+      );
+      if (!claim.claimed) {
+        const existing = this.assertSameRequest(claim.existing, hash);
+        const operation = operations.find((op) => op.id === existing.resourceId);
+        if (!operation) throw new NotFoundError('operação da chave de idempotência não encontrada');
+        return { payment, operations, operation, replayed: true, responseStatus: existing.responseStatus };
+      }
+      if (!planned.ok) throw planned.error; // desfaz a reserva junto com a transação
+
+      if (planned.value.payment !== payment) {
+        await repos.payments.update(planned.value.payment, payment.version);
+        await this.auditPaymentTransition(repos, ctx, payment, planned.value.payment, now);
+        await this.emit(repos, planned.value.payment, 'payment.state_changed', now);
+      }
+      await this.persistRequestedOperation(repos, ctx, planned.value.payment, planned.value.operation, provider, now);
+      return {
+        payment: planned.value.payment,
+        operations: [...operations, planned.value.operation],
+        operation: planned.value.operation,
+        replayed: false,
+        responseStatus: 202,
+      };
+    });
+  }
+
+  /**
+   * "Reconciliar agora": antecipa (ou agenda) a reconciliação por consulta da operação
+   * UNKNOWN do pagamento. Não chama o provedor — quem consulta é o worker — e nunca
+   * reenvia cobrança.
+   */
+  async requestReconciliation(ctx: RequestContext, paymentId: PaymentId): Promise<{ operation: Operation; scheduled: 'EXPEDITED' | 'ENQUEUED' }> {
+    const now = this.clock();
+    return this.uow.transaction(async (repos) => {
+      const payment = await this.lockPayment(repos, ctx.tenantId, paymentId);
+      const operations = await repos.operations.listByPayment(ctx.tenantId, paymentId);
+      const unknown = operations.find((op) => op.status === 'UNKNOWN');
+      if (!unknown) throw new NothingToReconcileError('o pagamento não tem operação com resultado desconhecido');
+      const provider = this.providers.get(payment.providerId);
+      if (!provider.capabilities.query) {
+        throw new ReconciliationRequiresManualActionError('o provedor não oferece consulta; use conciliação por arquivo ou resolução manual');
+      }
+      const expedited = await repos.jobs.makeAvailableNow(unknown.id, 'RECONCILE_OPERATION', now);
+      if (!expedited) {
+        await repos.jobs.enqueue(
+          {
+            kind: 'RECONCILE_OPERATION',
+            tenantId: payment.tenantId,
+            paymentId: payment.id,
+            operationId: unknown.id,
+            availableAt: now,
+            maxAttempts: this.reconcileMaxAttempts,
+          },
+          now,
+        );
+      }
+      await this.audit(repos, ctx, 'operation.reconciliation_requested', 'operation', unknown.id, now, {
+        operationKind: unknown.kind,
+        operationStatus: unknown.status,
+        jobKind: 'RECONCILE_OPERATION',
+      });
+      return { operation: unknown, scheduled: expedited ? 'EXPEDITED' : 'ENQUEUED' };
+    });
+  }
+
+  /**
+   * Processa uma tarefa reivindicada pelo worker. Garantia central: a transição
+   * PENDING -> IN_FLIGHT acontece sob o bloqueio do pagamento e só uma vez; uma
+   * operação encontrada já IN_FLIGHT (worker anterior caiu durante o envio) vira
+   * UNKNOWN e NUNCA é reenviada.
+   */
+  async processJob(job: Job, actor: Actor, lease: { readonly workerId: string; readonly leaseMs: number }): Promise<JobOutcome> {
+    if (job.kind === 'RECONCILE_OPERATION') return this.processReconcileJob(job, job.attempts, lease);
+
+    const now = this.clock();
+    const step = await this.uow.transaction(async (repos) => {
+      // Ordem fixa de bloqueio: pagamento, depois a tarefa. Fencing: sem posse válida do
+      // lease, não toca na operação (nem envia, nem marca UNKNOWN).
+      const payment = await repos.payments.lockById(job.tenantId, job.paymentId);
+      if (!(await repos.jobs.renewLease(job.id, lease.workerId, lease.leaseMs, now))) return { kind: 'LOST_LEASE' as const };
+      const operation = payment ? await repos.operations.findById(job.tenantId, job.operationId) : null;
+      if (!payment || !operation) return { kind: 'MISSING' as const };
+      if (operation.status === 'IN_FLIGHT') return { kind: 'INTERRUPTED' as const };
+      if (operation.status !== 'PENDING') return { kind: 'ALREADY_PROCESSED' as const, status: operation.status };
+
+      const provider = this.providers.get(payment.providerId);
+      const dispatched = markDispatched(operation, provider.capabilities, now);
+      await repos.operations.update(dispatched, operation.version);
+      await this.audit(repos, { tenantId: payment.tenantId, actor, correlationId: null }, 'operation.dispatched', 'operation', operation.id, now, {
+        operationKind: dispatched.kind,
+        fromOperationStatus: operation.status,
+        operationStatus: dispatched.status,
+        amountCents: dispatched.amount.cents,
+        providerId: payment.providerId,
+        providerKind: provider.kind,
+      });
+      const operations = await repos.operations.listByPayment(job.tenantId, job.paymentId);
+      const original = operations.find((op) => op.kind === 'AUTHORIZATION' && op.status === 'SUCCEEDED');
+      return { kind: 'DISPATCHED' as const, payment, operation: dispatched, provider, originalReference: original?.providerReference ?? null };
+    });
+
+    switch (step.kind) {
+      case 'LOST_LEASE':
+        this.logger.warn({ jobId: job.id, workerId: lease.workerId }, 'lease perdido antes do processamento; nada foi feito');
+        return { kind: 'LOST_LEASE' };
+      case 'MISSING':
+        this.logger.error({ jobId: job.id, operationId: job.operationId }, 'tarefa sem pagamento/operação correspondente');
+        return { kind: 'DONE', detail: 'MISSING' };
+      case 'ALREADY_PROCESSED':
+        return { kind: 'DONE', detail: `ALREADY_${step.status}` };
+      case 'INTERRUPTED':
+        this.logger.warn({ jobId: job.id, operationId: job.operationId }, 'operação encontrada IN_FLIGHT: worker anterior interrompido; marcando UNKNOWN sem reenviar');
+        await this.recordOutcome(job.operationId, { status: 'UNKNOWN', reason: 'WORKER_INTERRUPTED_AFTER_DISPATCH' }, actor, null);
+        return { kind: 'DONE', detail: 'INTERRUPTED_MARKED_UNKNOWN' };
+      case 'DISPATCHED': {
+        const outcome = await this.callProvider(step.provider, step.payment, step.operation, step.originalReference);
+        const applied = await this.recordOutcome(step.operation.id, outcome, actor, null);
+        return { kind: 'DONE', detail: applied.operation.status };
+      }
+    }
+  }
+
+  private async processReconcileJob(job: Job, attempt: number, lease: { readonly workerId: string; readonly leaseMs: number }): Promise<JobOutcome> {
+    const located = await this.uow.transaction(async (repos) => {
+      if (!(await repos.jobs.renewLease(job.id, lease.workerId, lease.leaseMs, this.clock()))) return 'LOST_LEASE' as const;
+      return repos.operations.findById(job.tenantId, job.operationId);
+    });
+    if (located === 'LOST_LEASE') return { kind: 'LOST_LEASE' };
+    const operation = located;
+    if (operation?.status !== 'UNKNOWN') return { kind: 'DONE', detail: 'NOT_UNKNOWN' };
+    try {
+      const result = await this.reconcileOperation(job.operationId);
+      if (result.resolved) return { kind: 'DONE', detail: `RESOLVED_${result.operation.status}` };
+    } catch (error) {
+      if (error instanceof ReconciliationRequiresManualActionError) return { kind: 'DONE', detail: 'REQUIRES_MANUAL_ACTION' };
+      throw error;
+    }
+    // Recuo exponencial limitado (consulta não é reenvio de cobrança).
+    const delay = Math.min(this.reconcileDelayMs * 2 ** Math.max(0, attempt - 1), 5 * 60_000);
+    return { kind: 'RETRY', availableAt: new Date(this.clock().getTime() + delay), errorCode: 'RECONCILIATION_UNRESOLVED' };
   }
 
   private async executeOperation(
@@ -416,6 +718,20 @@ export class PaymentService {
 
     const ctx: RequestContext = { tenantId: payment.tenantId, actor, correlationId };
     await repos.operations.update(result.operation, operation.version);
+    // UNKNOWN: agenda reconciliação por CONSULTA (nunca reenvio), se o provedor a oferece.
+    if (result.operation.status === 'UNKNOWN' && provider.capabilities.query) {
+      await repos.jobs.enqueue(
+        {
+          kind: 'RECONCILE_OPERATION',
+          tenantId: payment.tenantId,
+          paymentId: payment.id,
+          operationId: operation.id,
+          availableAt: new Date(now.getTime() + this.reconcileDelayMs),
+          maxAttempts: this.reconcileMaxAttempts,
+        },
+        now,
+      );
+    }
     await this.audit(repos, ctx, 'operation.result_recorded', 'operation', operation.id, now, {
       operationKind: operation.kind,
       fromOperationStatus: operation.status,

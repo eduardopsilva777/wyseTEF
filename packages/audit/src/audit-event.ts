@@ -29,6 +29,14 @@ export const AUDIT_DATA_ALLOWED_KEYS = [
   'supportingDocumentRef',
   'idempotentReplay',
   'reason',
+  'customerId',
+  'name',
+  'label',
+  'city',
+  'entityStatus',
+  'previousStatus',
+  'testDirective',
+  'jobKind',
 ] as const;
 
 export type AuditDataKey = (typeof AUDIT_DATA_ALLOWED_KEYS)[number];
@@ -53,6 +61,7 @@ export function sanitizeAuditData(data: Readonly<Record<string, unknown>>): Audi
 }
 
 export type ActorType = 'API_CLIENT' | 'SYSTEM' | 'OPERATOR';
+export type AuditResourceType = 'payment' | 'operation' | 'customer' | 'merchant' | 'terminal';
 
 export interface AuditEventInput {
   readonly tenantId: string;
@@ -60,7 +69,7 @@ export interface AuditEventInput {
   readonly actorType: ActorType;
   readonly actorId: string;
   readonly action: string;
-  readonly resourceType: 'payment' | 'operation';
+  readonly resourceType: AuditResourceType;
   readonly resourceId: string;
   readonly correlationId: string | null;
   readonly data: AuditData;

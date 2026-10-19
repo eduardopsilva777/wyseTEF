@@ -1,4 +1,5 @@
 export * from './capabilities.ts';
+export * from './catalog.ts';
 export * from './errors.ts';
 export * from './evidence.ts';
 export * from './ids.ts';

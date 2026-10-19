@@ -23,7 +23,7 @@ A semântica exata de cancelamento e estorno (prazos, liquidação, parcial) var
 | Estado | Significado | Final? |
 |---|---|---|
 | CREATED | Registrado; nada enviado | não |
-| PROCESSING | Autorização gravada e enviada (ou possivelmente enviada) | não |
+| PROCESSING | Autorização aceita para processamento; a operação pode estar na fila (`PENDING`) ou enviada (`IN_FLIGHT`) — ver ADR 0013 | não |
 | AUTHORIZED | Aprovado pelo provedor; aguarda confirmação (somente com `twoPhaseConfirmation`) | não |
 | APPROVED | Aprovado (e confirmado, se aplicável). Aceita cancelamento e estornos | não* |
 | DECLINED | Recusado com evidência | sim |
@@ -73,13 +73,21 @@ PENDING → IN_FLIGHT → { SUCCEEDED | REJECTED | ABORTED | NOT_SENT | UNKNOWN 
 
 Confirmação ou desfazimento recusados levam a UNKNOWN porque a recusa **não prova** o resultado financeiro da autorização.
 
+## Processamento assíncrono (ADR 0013)
+
+- A API grava pagamento, operação `PENDING` e tarefa na mesma transação e responde 202.
+- O worker faz `PENDING → IN_FLIGHT` sob o bloqueio do pagamento, uma única vez; só então chama o provedor.
+- Tarefa reivindicada de novo com a operação já `IN_FLIGHT` (worker anterior caiu): `UNKNOWN` (`WORKER_INTERRUPTED_AFTER_DISPATCH`), sem reenvio.
+- `UNKNOWN` com provedor que oferece consulta: tarefa `RECONCILE_OPERATION` com recuo exponencial; ao esgotar as tentativas, fica `FAILED` para ação manual.
+- "Reconciliar agora" no painel apenas antecipa essa tarefa; a API não consulta o provedor.
+
 ## Concorrência, timeouts e repetição
 
 - Toda mudança acontece com o pagamento bloqueado (`FOR UPDATE`) e com verificação de versão.
 - Timeout da chamada ao provedor (`TEF_PROVIDER_TIMEOUT_MS`) → UNKNOWN (`PROVIDER_TIMEOUT`). Erro após possível envio → UNKNOWN (`PROVIDER_CALL_FAILED`).
 - Resposta duplicada ou notificação repetida: mesmo resultado não altera nada; resultado contraditório é rejeitado (`CONFLICTING_EVIDENCE`) e auditado.
 - Resposta tardia (após UNKNOWN): pode resolver a operação se vier do provedor (notificação, consulta). A resposta síncrona que chega depois do timeout é descartada; a resolução vem por notificação ou consulta.
-- Queda do processo: `recoverStaleInFlight(olderThanMs)` converte IN_FLIGHT antigo em UNKNOWN.
+- Queda do processo: o lease da tarefa expira e outro worker a retoma (ver acima); a varredura `recoverStaleInFlight` cobre operações sem tarefa.
 
 ## Referência comercial
 Fica protegida enquanto o pagamento estiver em qualquer estado **exceto** DECLINED e CANCELLED. Assim, após recusa o cliente pode tentar outro cartão com a mesma referência; com UNKNOWN, não. Pagamento dividido (dois cartões no mesmo pedido) usa referências distintas, uma por intenção de cobrança.

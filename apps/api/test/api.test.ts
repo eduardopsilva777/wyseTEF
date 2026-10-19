@@ -2,10 +2,11 @@ import { createHash, randomBytes } from 'node:crypto';
 import { Writable } from 'node:stream';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
-import { PaymentService } from '@tef/application';
+import { OutboxPublisher, PaymentService, Worker } from '@tef/application';
 import { InMemoryUnitOfWork } from '@tef/persistence/memory';
 import { createProviderRegistry } from '@tef/provider-contract';
-import { PaymentSimulator, SIMULATOR_PROVIDER_ID, type SimulatorScenario } from '@tef/provider-simulator';
+import { PaymentSimulator, type SimulatorScenario } from '@tef/provider-simulator';
+import { seedCatalog } from '../../../tests/support/catalog.ts';
 import { buildApp } from '../src/app.ts';
 import { createAuthenticator } from '../src/auth.ts';
 import { createLogger } from '../src/logging.ts';
@@ -22,9 +23,11 @@ interface TestContext {
   app: FastifyInstance;
   logs: string[];
   scenario: { current: SimulatorScenario };
+  /** Executa uma iteração do worker (mesmo processo, mesma persistência). */
+  work: () => Promise<void>;
 }
 
-function setup(): TestContext {
+async function setup(): Promise<TestContext> {
   const logs: string[] = [];
   const stream = new Writable({
     write(chunk: Buffer, _enc, cb) {
@@ -36,23 +39,38 @@ function setup(): TestContext {
   const simulator = new PaymentSimulator({ scenario: () => scenario.current });
   const providers = createProviderRegistry([simulator]);
   const logger = createLogger('debug', false, stream);
-  const service = new PaymentService({ uow: new InMemoryUnitOfWork(), providers, providerTimeoutMs: 50, logger });
+  const uow = new InMemoryUnitOfWork();
+  await seedCatalog(uow);
+  const service = new PaymentService({ uow, providers, providerTimeoutMs: 50, logger });
+  const worker = new Worker({
+    uow,
+    service,
+    publisher: new OutboxPublisher({ uow, sink: { deliver: () => Promise.resolve() } }),
+    workerId: 'test-worker',
+    leaseMs: 5_000,
+  });
   const app = buildApp({
     service,
     providers,
-    defaultProviderId: SIMULATOR_PROVIDER_ID,
     logger,
     authenticate: createAuthenticator([
       { keyId: 'key-a', keySha256: sha(KEY_A), tenantId: 'tenant-a', merchantIds: ['merchant-1', 'merchant-2'] },
       { keyId: 'key-b', keySha256: sha(KEY_B), tenantId: 'tenant-b', merchantIds: ['merchant-1'] },
     ]),
   });
-  return { app, logs, scenario };
+  return {
+    app,
+    logs,
+    scenario,
+    work: async () => {
+      await worker.runOnce();
+    },
+  };
 }
 
 let t: TestContext;
-beforeEach(() => {
-  t = setup();
+beforeEach(async () => {
+  t = await setup();
 });
 afterEach(async () => {
   await t.app.close();
@@ -86,12 +104,12 @@ describe('API: autenticação e autorização', () => {
   });
 
   it('rejeita estabelecimento não autorizado para a credencial (403)', async () => {
-    const res = await createPayment(body({ merchantId: 'merchant-2' }), key(), KEY_B);
+    const res = await createPayment(body({ merchantId: 'merchant-2', terminalId: 'terminal-2' }), key(), KEY_B);
     expect(res.statusCode).toBe(403);
   });
 
   it('outro tenant recebe 404 ao consultar ou operar o pagamento', async () => {
-    const created = (await createPayment()).json<{ id: string }>();
+    const created = (await createPayment(body({ authorize: false }))).json<{ id: string }>();
     const read = await t.app.inject({ method: 'GET', url: `/v1/payments/${created.id}`, headers: auth(KEY_B) });
     expect(read.statusCode).toBe(404);
     const op = await t.app.inject({
@@ -137,16 +155,24 @@ describe('API: validação de entrada', () => {
     });
     expect(res.statusCode).toBe(400);
   });
+
+  it('terminal de outro estabelecimento ou inexistente é recusado (422)', async () => {
+    const wrong = await createPayment(body({ merchantId: 'merchant-2', terminalId: 'terminal-1' }));
+    expect(wrong.statusCode).toBe(422);
+    expect(wrong.json()).toMatchObject({ error: { code: 'REFERENCE_INVALID' } });
+    const missing = await createPayment(body({ terminalId: 'nao-existe' }));
+    expect(missing.statusCode).toBe(422);
+  });
 });
 
-describe('API: idempotência e fluxo', () => {
-  it('mesma chave e conteúdo: 201 repetido com o mesmo recurso e cabeçalho de repetição', async () => {
+describe('API: idempotência e fluxo assíncrono', () => {
+  it('mesma chave e conteúdo: 202 repetido com o mesmo recurso e cabeçalho de repetição', async () => {
     const payload = body();
     const k = key();
     const first = await createPayment(payload, k);
     const second = await createPayment(payload, k);
-    expect(first.statusCode).toBe(201);
-    expect(second.statusCode).toBe(201);
+    expect(first.statusCode).toBe(202);
+    expect(second.statusCode).toBe(202);
     expect(second.headers['idempotent-replayed']).toBe('true');
     expect(second.json<{ id: string }>().id).toBe(first.json<{ id: string }>().id);
   });
@@ -168,17 +194,17 @@ describe('API: idempotência e fluxo', () => {
     expect(res.json()).toMatchObject({ error: { code: 'DUPLICATE_REFERENCE' } });
   });
 
-  it('fluxo: criar, autorizar, estornar parcialmente e consultar', async () => {
-    const created = (await createPayment(body({ amount: { cents: 5_000, currency: 'BRL' } }))).json<{ id: string; provider: unknown }>();
+  it('criar (202), worker autoriza, estornar (202), worker estorna, consultar', async () => {
+    const createdRes = await createPayment(body({ amount: { cents: 5_000, currency: 'BRL' } }));
+    expect(createdRes.statusCode).toBe(202);
+    const created = createdRes.json<{ id: string; provider: unknown; state: string; operations: { status: string }[] }>();
     expect(created.provider).toEqual({ id: 'SIMULATOR', kind: 'SIMULATOR', simulated: true });
+    expect(created.state).toBe('PROCESSING');
+    expect(created.operations[0]?.status).toBe('PENDING');
 
-    const authorized = await t.app.inject({
-      method: 'POST',
-      url: `/v1/payments/${created.id}/authorize`,
-      headers: { ...auth(), 'idempotency-key': key() },
-    });
-    expect(authorized.statusCode).toBe(200);
-    expect(authorized.json()).toMatchObject({ operation: { kind: 'AUTHORIZATION', status: 'SUCCEEDED' }, payment: { state: 'APPROVED' } });
+    await t.work();
+    const approved = await t.app.inject({ method: 'GET', url: `/v1/payments/${created.id}`, headers: auth() });
+    expect(approved.json()).toMatchObject({ state: 'APPROVED', operations: [{ kind: 'AUTHORIZATION', status: 'SUCCEEDED' }] });
 
     const refund = await t.app.inject({
       method: 'POST',
@@ -186,25 +212,32 @@ describe('API: idempotência e fluxo', () => {
       headers: { ...auth(), 'idempotency-key': key() },
       payload: { amount: { cents: 1_500, currency: 'BRL' } },
     });
-    expect(refund.statusCode).toBe(200);
-    expect(refund.json()).toMatchObject({
-      payment: { state: 'APPROVED', reversedAmount: { cents: 1_500 }, netApprovedAmount: { cents: 3_500 } },
-    });
+    expect(refund.statusCode).toBe(202);
+    expect(refund.json()).toMatchObject({ operation: { kind: 'REFUND', status: 'PENDING' }, payment: { reversedAmount: { cents: 0 } } });
 
+    await t.work();
     const read = await t.app.inject({ method: 'GET', url: `/v1/payments/${created.id}`, headers: auth() });
+    expect(read.json()).toMatchObject({ state: 'APPROVED', reversedAmount: { cents: 1_500 }, netApprovedAmount: { cents: 3_500 } });
     expect(read.json<{ operations: unknown[] }>().operations).toHaveLength(2);
     expect(read.headers['cache-control']).toBe('no-store');
+  });
+
+  it('sem autorização automática: 201 e depois POST /authorize (202)', async () => {
+    const res = await createPayment(body({ authorize: false }));
+    expect(res.statusCode).toBe(201);
+    const id = res.json<{ id: string }>().id;
+    const accepted = await t.app.inject({ method: 'POST', url: `/v1/payments/${id}/authorize`, headers: { ...auth(), 'idempotency-key': key() } });
+    expect(accepted.statusCode).toBe(202);
+    await t.work();
+    expect((await t.app.inject({ method: 'GET', url: `/v1/payments/${id}`, headers: auth() })).json()).toMatchObject({ state: 'APPROVED' });
   });
 
   it('resultado desconhecido é exposto como UNKNOWN e nova autorização é recusada', async () => {
     t.scenario.current = { type: 'TIMEOUT_AFTER_SEND', hiddenOutcome: 'SUCCEEDED' };
     const created = (await createPayment()).json<{ id: string }>();
-    const res = await t.app.inject({
-      method: 'POST',
-      url: `/v1/payments/${created.id}/authorize`,
-      headers: { ...auth(), 'idempotency-key': key() },
-    });
-    expect(res.json()).toMatchObject({ payment: { state: 'UNKNOWN' }, operation: { status: 'UNKNOWN' } });
+    await t.work();
+    const res = await t.app.inject({ method: 'GET', url: `/v1/payments/${created.id}`, headers: auth() });
+    expect(res.json()).toMatchObject({ state: 'UNKNOWN', operations: [{ status: 'UNKNOWN' }] });
     const retry = await t.app.inject({
       method: 'POST',
       url: `/v1/payments/${created.id}/authorize`,
@@ -230,6 +263,7 @@ describe('API: sanitização de logs', () => {
       headers: { ...auth(), 'idempotency-key': key() },
       payload: { ...body(), pan: TEST_PAN, cvv: '123', track2: `;${TEST_PAN}=2512?` },
     });
+    await t.work();
     const output = t.logs.join('');
     expect(output.length).toBeGreaterThan(0);
     expect(output).not.toContain(KEY_A);
@@ -241,7 +275,7 @@ describe('API: sanitização de logs', () => {
   });
 
   it('erros inesperados não vazam detalhes na resposta', async () => {
-    const broken = setup();
+    const broken = await setup();
     broken.app.get('/boom', () => {
       throw new Error(`falha interna com segredo ${KEY_A}`);
     });

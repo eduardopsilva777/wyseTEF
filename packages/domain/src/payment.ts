@@ -83,6 +83,8 @@ export type OperationOutcome =
   | { readonly status: 'UNKNOWN'; readonly reason: string };
 
 export interface CreatePaymentInput {
+  /** ID gerado previamente (ex.: para reservar a chave de idempotência antes da validação). */
+  readonly id?: PaymentId;
   readonly tenantId: TenantId;
   readonly merchantId: MerchantId;
   readonly terminalId: TerminalId;
@@ -95,9 +97,10 @@ export function createPayment(input: CreatePaymentInput, now: Date): Payment {
   if (input.amount.cents <= 0) {
     throw new InvariantViolationError('pagamento exige valor positivo');
   }
+  const { id, ...rest } = input;
   return {
-    id: newPaymentId(),
-    ...input,
+    id: id ?? newPaymentId(),
+    ...rest,
     reversedAmount: money(0, input.amount.currency),
     state: 'CREATED',
     stateReason: null,

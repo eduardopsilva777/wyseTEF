@@ -18,4 +18,10 @@ Status possíveis: **Aceita**, **Provisória** (vale até a condição de revis�
 | [0009](0009-autenticacao-provisoria-chave-api.md) | Autenticação por chave de API | Provisória |
 | [0010](0010-typescript-sem-build-em-desenvolvimento.md) | Execução de TypeScript sem etapa de build em desenvolvimento | Provisória |
 | [0011](0011-agente-local-adiado.md) | Linguagem e estratégia offline do agente local | Pendente |
-| [0012](0012-api-sincrona-na-f1.md) | Chamada ao provedor dentro da requisição na F1 | Provisória |
+| [0012](0012-api-sincrona-na-f1.md) | Chamada ao provedor dentro da requisição na F1 | Substituída (0013) |
+| [0013](0013-modelo-assincrono-fila-duravel.md) | Modelo assíncrono: API 202, fila durável no PostgreSQL e worker | Aceita |
+| [0014](0014-cadastro-cliente-estabelecimento-terminal.md) | Cadastro cliente → estabelecimento → terminal com integridade referencial | Aceita |
+| [0015](0015-acesso-administrativo-local.md) | Acesso administrativo exclusivo do ambiente local | Provisória (somente desenvolvimento) |
+| [0016](0016-livro-duravel-do-simulador.md) | Livro durável do simulador; a API nunca chama o provedor | Aceita |
+| [0017](0017-painel-web-local.md) | Painel web local (React + Vite) sem segredos no navegador | Aceita |
+| [0018](0018-pacote-observability.md) | Logger sanitizado compartilhado (@tef/observability) | Aceita |

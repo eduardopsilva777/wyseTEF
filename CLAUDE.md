@@ -35,6 +35,15 @@ A direção de produto controla escopo e aprova decisões arquiteturais relevant
 - Idempotência por `(tenant, estabelecimento, escopo, chave)` com hash canônico. Idempotência interna não garante idempotência na adquirente.
 - Estado de pagamento é separado do estado fiscal.
 
+## Modelo assíncrono e painel (F2A)
+- A API **nunca chama o provedor**: só aceita trabalho (201/202) e grava tarefas na mesma transação. Quem executa e consulta é o worker.
+- Toda operação passa por `PENDING → IN_FLIGHT` sob bloqueio, uma única vez. Operação encontrada `IN_FLIGHT` por uma tarefa retomada vira `UNKNOWN`; nunca reenviar.
+- Fila e outbox vivem no PostgreSQL; nada de fila em memória ou temporizadores como mecanismo durável.
+- Estado do simulador fica no livro durável (`simulator_ledger`); "não encontrado" só é confiável se o livro for compartilhado.
+- Painel: nenhum segredo no código do navegador, nada de variáveis `VITE_`, nenhuma leitura de `import.meta.env`; autorização sempre no servidor.
+- O acesso administrativo local (`TEF_DEV_ADMIN_TOKEN_SHA256`) é só de desenvolvimento; nunca habilitá-lo em produção nem apresentá-lo como autenticação do produto.
+- Exclusões de cadastro com histórico são recusadas; prefira desativação. Pagamentos nunca são excluídos.
+
 ## Arquitetura
 - Monólito modular hexagonal. `domain` não faz I/O (o lint impede). Adaptadores traduzem; não decidem estado.
 - Sem microsserviços nem abstrações especulativas.
@@ -44,7 +53,7 @@ A direção de produto controla escopo e aprova decisões arquiteturais relevant
 - Linguagem e estratégia offline do agente local continuam pendentes até análise do SDK oficial (ADR 0011).
 
 ## Fluxo de trabalho
-- Antes de concluir: `npm run lint`, `npm run typecheck`, `npm test` e, para mudanças de persistência, `npm run test:db` (exige Docker: `npm run db:up`).
+- Antes de concluir: `npm run lint`, `npm run typecheck`, `npm test`, `npm run check:web` e, para mudanças de persistência ou fila, `npm run test:db` (exige Docker: `npm run db:up`).
 - Não declarar sucesso sem evidência. Teste bloqueado por dependência externa deve ser relatado como bloqueado, nunca como aprovado.
 - Garantias transacionais só contam como verificadas quando testadas no PostgreSQL.
 - Preservar alterações existentes; não sobrescrever configurações globais da máquina.

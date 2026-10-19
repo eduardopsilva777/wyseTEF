@@ -1,3 +1,4 @@
+export { DevAdminAuth } from './admin-auth.ts';
 export { buildApp, type AppDeps } from './app.ts';
 export { createAuthenticator, type Principal } from './auth.ts';
 export { ConfigError, loadConfig, type AppConfig } from './config.ts';

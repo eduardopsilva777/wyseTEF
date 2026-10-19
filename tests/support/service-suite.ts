@@ -34,7 +34,7 @@ import {
 export interface SuiteBackend {
   readonly name: string;
   /** Cria (ou reaproveita) a unidade de trabalho do backend. */
-  readonly uow: () => UnitOfWork;
+  readonly uow: () => UnitOfWork | Promise<UnitOfWork>;
   readonly auditFor: (tenantId: TenantId) => Promise<AuditRecord[]>;
   readonly outboxEventTypes: (paymentId: PaymentId) => Promise<string[]>;
 }
@@ -44,11 +44,11 @@ export interface SuiteBackend {
  * (tests/application) e contra o PostgreSQL real (tests/integration).
  */
 export function describePaymentServiceSuite(backend: SuiteBackend): void {
-  const harness = (options: Omit<HarnessOptions, 'uow'> = {}) => createHarness({ ...options, uow: backend.uow() });
+  const harness = async (options: Omit<HarnessOptions, 'uow'> = {}) => createHarness({ ...options, uow: await backend.uow() });
 
   describe(`[${backend.name}] criação e idempotência`, () => {
     it('cria pagamento em CREATED com auditoria e evento no outbox', async () => {
-      const h = harness();
+      const h = await harness();
       const result = await h.service.createPayment(ctxA, createCommand(), newKey());
       expect(result.payment.state).toBe('CREATED');
       expect(result.replayed).toBe(false);
@@ -58,7 +58,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('mesma chave e mesmo conteúdo: devolve o existente sem criar outro', async () => {
-      const h = harness();
+      const h = await harness();
       const key = newKey();
       const command = createCommand();
       const first = await h.service.createPayment(ctxA, command, key);
@@ -71,7 +71,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('mesma chave e conteúdo diferente: conflito', async () => {
-      const h = harness();
+      const h = await harness();
       const key = newKey();
       const command = createCommand(10_000);
       await h.service.createPayment(ctxA, command, key);
@@ -79,7 +79,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('a chave é escopada por tenant', async () => {
-      const h = harness();
+      const h = await harness();
       const key = newKey();
       const a = await h.service.createPayment(ctxA, createCommand(), key);
       const b = await h.service.createPayment(ctxB, createCommand(), key);
@@ -88,14 +88,14 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('mesma referência comercial com outra chave: bloqueada', async () => {
-      const h = harness();
+      const h = await harness();
       const command = createCommand();
       await h.service.createPayment(ctxA, command, newKey());
       await expect(h.service.createPayment(ctxA, command, newKey())).rejects.toBeInstanceOf(DuplicateReferenceError);
     });
 
     it('referência é liberada após recusa, mas continua protegida enquanto UNKNOWN', async () => {
-      const h = harness();
+      const h = await harness();
       h.scenario = { type: 'DECLINE' };
       const declinedCmd = createCommand();
       const declined = await h.service.createPayment(ctxA, declinedCmd, newKey());
@@ -111,7 +111,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('concorrência: N criações simultâneas com a mesma chave geram UM pagamento', async () => {
-      const h = harness();
+      const h = await harness();
       const key = newKey();
       const command = createCommand();
       const results = await Promise.all(Array.from({ length: 10 }, () => h.service.createPayment(ctxA, command, key)));
@@ -121,7 +121,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('concorrência: N criações simultâneas com chaves diferentes e mesma referência geram UM pagamento', async () => {
-      const h = harness();
+      const h = await harness();
       const command = createCommand();
       const results = await Promise.allSettled(Array.from({ length: 10 }, () => h.service.createPayment(ctxA, command, newKey())));
       const ok = results.filter((r) => r.status === 'fulfilled');
@@ -133,7 +133,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
 
   describe(`[${backend.name}] autorização e falhas`, () => {
     it('aprovação registra evidência da resposta do provedor', async () => {
-      const h = harness();
+      const h = await harness();
       const { payment } = await h.service.createPayment(ctxA, createCommand(), newKey());
       const result = await h.service.authorize(ctxA, payment.id, newKey());
       expect(result.payment.state).toBe('APPROVED');
@@ -143,14 +143,14 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('recusa -> DECLINED', async () => {
-      const h = harness();
+      const h = await harness();
       h.scenario = { type: 'DECLINE' };
       const { payment } = await h.service.createPayment(ctxA, createCommand(), newKey());
       expect((await h.service.authorize(ctxA, payment.id, newKey())).payment.state).toBe('DECLINED');
     });
 
     it('timeout antes do envio -> CANCELLED (NOT_SENT) e nada chegou ao provedor', async () => {
-      const h = harness();
+      const h = await harness();
       h.scenario = { type: 'TIMEOUT_BEFORE_SEND' };
       const { payment } = await h.service.createPayment(ctxA, createCommand(), newKey());
       const result = await h.service.authorize(ctxA, payment.id, newKey());
@@ -160,7 +160,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('timeout após envio -> UNKNOWN persistido; sem nova cobrança; reconciliação esclarece', async () => {
-      const h = harness({ providerTimeoutMs: 20 });
+      const h = await harness({ providerTimeoutMs: 20 });
       h.scenario = { type: 'TIMEOUT_AFTER_SEND', hiddenOutcome: 'SUCCEEDED' };
       const command = createCommand();
       const { payment } = await h.service.createPayment(ctxA, command, newKey());
@@ -187,7 +187,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('falha de comunicação -> UNKNOWN; consulta revela recusa', async () => {
-      const h = harness();
+      const h = await harness();
       h.scenario = { type: 'COMMUNICATION_FAILURE', hiddenOutcome: 'REJECTED' };
       const { payment } = await h.service.createPayment(ctxA, createCommand(), newKey());
       const result = await h.service.authorize(ctxA, payment.id, newKey());
@@ -197,7 +197,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('resposta atrasada (após o timeout) -> UNKNOWN, depois resolvido pela notificação', async () => {
-      const h = harness({ providerTimeoutMs: 20, forwardNotifications: true });
+      const h = await harness({ providerTimeoutMs: 20, forwardNotifications: true });
       h.scenario = { type: 'DELAYED_RESPONSE', delayMs: 80, outcome: 'SUCCEEDED' };
       const { payment } = await h.service.createPayment(ctxA, createCommand(), newKey());
       const result = await h.service.authorize(ctxA, payment.id, newKey());
@@ -209,7 +209,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('resposta duplicada não altera nada na segunda e terceira entrega', async () => {
-      const h = harness();
+      const h = await harness();
       h.scenario = { type: 'DUPLICATE_RESPONSE' };
       const { payment } = await h.service.createPayment(ctxA, createCommand(), newKey());
       const result = await h.service.authorize(ctxA, payment.id, newKey());
@@ -226,7 +226,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('notificação contraditória é rejeitada e auditada', async () => {
-      const h = harness();
+      const h = await harness();
       const { payment } = await h.service.createPayment(ctxA, createCommand(), newKey());
       const result = await h.service.authorize(ctxA, payment.id, newKey());
       await expect(
@@ -242,7 +242,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('notificação de outro provedor é rejeitada', async () => {
-      const h = harness();
+      const h = await harness();
       h.scenario = { type: 'UNKNOWN_THEN_RECONCILED', hiddenOutcome: 'SUCCEEDED' };
       const { payment } = await h.service.createPayment(ctxA, createCommand(), newKey());
       const result = await h.service.authorize(ctxA, payment.id, newKey());
@@ -256,7 +256,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('reconciliação: "não encontrado" definitivo cancela; não definitivo mantém UNKNOWN', async () => {
-      const definitive = harness({ capabilities: { ...DEFAULT_SIMULATOR_CAPABILITIES, guaranteesNotSentOnPreSendFailure: false } });
+      const definitive = await harness({ capabilities: { ...DEFAULT_SIMULATOR_CAPABILITIES, guaranteesNotSentOnPreSendFailure: false } });
       definitive.scenario = { type: 'TIMEOUT_BEFORE_SEND' };
       const a = await definitive.service.createPayment(ctxA, createCommand(), newKey());
       const ra = await definitive.service.authorize(ctxA, a.payment.id, newKey());
@@ -265,7 +265,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
       expect(resolved.payment.state).toBe('CANCELLED');
       expect(resolved.operation.status).toBe('NOT_SENT');
 
-      const notDefinitive = harness({
+      const notDefinitive = await harness({
         capabilities: { ...DEFAULT_SIMULATOR_CAPABILITIES, guaranteesNotSentOnPreSendFailure: false, queryNotFoundIsDefinitive: false },
       });
       notDefinitive.scenario = { type: 'TIMEOUT_BEFORE_SEND' };
@@ -277,7 +277,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('sem consulta: exige ação manual; resolução manual exige dupla aprovação', async () => {
-      const h = harness({ capabilities: { ...DEFAULT_SIMULATOR_CAPABILITIES, query: false, queryNotFoundIsDefinitive: false } });
+      const h = await harness({ capabilities: { ...DEFAULT_SIMULATOR_CAPABILITIES, query: false, queryNotFoundIsDefinitive: false } });
       h.scenario = { type: 'UNKNOWN_THEN_RECONCILED', hiddenOutcome: 'SUCCEEDED' };
       const { payment } = await h.service.createPayment(ctxA, createCommand(), newKey());
       const result = await h.service.authorize(ctxA, payment.id, newKey());
@@ -301,7 +301,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('autorização idempotente: mesma chave não reenvia ao provedor', async () => {
-      const h = harness();
+      const h = await harness();
       const { payment } = await h.service.createPayment(ctxA, createCommand(), newKey());
       const key = newKey();
       const first = await h.service.authorize(ctxA, payment.id, key);
@@ -312,7 +312,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('concorrência: autorizações simultâneas geram UMA operação e UM envio', async () => {
-      const h = harness();
+      const h = await harness();
       const { payment } = await h.service.createPayment(ctxA, createCommand(), newKey());
       const sameKey = newKey();
       const results = await Promise.allSettled([
@@ -328,7 +328,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('queda do processo durante o envio: recuperação marca UNKNOWN e não reenvia', async () => {
-      const h = harness({ providerTimeoutMs: 300 });
+      const h = await harness({ providerTimeoutMs: 300 });
       h.scenario = { type: 'TIMEOUT_AFTER_SEND', hiddenOutcome: 'SUCCEEDED' };
       const { payment } = await h.service.createPayment(ctxA, createCommand(), newKey());
       const inFlight = h.service.authorize(ctxA, payment.id, newKey());
@@ -349,7 +349,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('resultado incompatível com as capacidades declaradas é tratado como UNKNOWN', async () => {
-      const h = harness(); // sem duas fases
+      const h = await harness(); // sem duas fases
       h.scenario = { type: 'APPROVE', requiresConfirmation: true };
       const { payment } = await h.service.createPayment(ctxA, createCommand(), newKey());
       const result = await h.service.authorize(ctxA, payment.id, newKey());
@@ -358,7 +358,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('desistência antes do envio', async () => {
-      const h = harness();
+      const h = await harness();
       const { payment } = await h.service.createPayment(ctxA, createCommand(), newKey());
       expect((await h.service.cancelBeforeSubmission(ctxA, payment.id)).payment.state).toBe('CANCELLED');
       await expect(h.service.authorize(ctxA, payment.id, newKey())).rejects.toBeInstanceOf(InvalidTransitionError);
@@ -367,7 +367,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
 
   describe(`[${backend.name}] confirmação, desfazimento, cancelamento e estornos`, () => {
     it('duas fases: AUTHORIZED -> confirmação -> APPROVED', async () => {
-      const h = harness({ capabilities: ALL_SIM_CAPABILITIES });
+      const h = await harness({ capabilities: ALL_SIM_CAPABILITIES });
       h.scenario = { type: 'APPROVE', requiresConfirmation: true };
       const { payment } = await h.service.createPayment(ctxA, createCommand(), newKey());
       expect((await h.service.authorize(ctxA, payment.id, newKey())).payment.state).toBe('AUTHORIZED');
@@ -378,7 +378,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('duas fases: AUTHORIZED -> desfazimento -> REVERSED', async () => {
-      const h = harness({ capabilities: ALL_SIM_CAPABILITIES });
+      const h = await harness({ capabilities: ALL_SIM_CAPABILITIES });
       h.scenario = { type: 'APPROVE', requiresConfirmation: true };
       const { payment } = await h.service.createPayment(ctxA, createCommand(), newKey());
       await h.service.authorize(ctxA, payment.id, newKey());
@@ -389,7 +389,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('cancelamento total -> REVERSED', async () => {
-      const h = harness();
+      const h = await harness();
       const { payment } = await h.service.createPayment(ctxA, createCommand(), newKey());
       await h.service.authorize(ctxA, payment.id, newKey());
       const cancelled = await h.service.cancel(ctxA, payment.id, newKey());
@@ -399,7 +399,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('estornos parciais e total, com saldo contabilizado', async () => {
-      const h = harness();
+      const h = await harness();
       const { payment } = await h.service.createPayment(ctxA, createCommand(10_000), newKey());
       await h.service.authorize(ctxA, payment.id, newKey());
       const r1 = await h.service.refund(ctxA, payment.id, money(3_000), newKey());
@@ -412,7 +412,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('estorno idempotente pela chave', async () => {
-      const h = harness();
+      const h = await harness();
       const { payment } = await h.service.createPayment(ctxA, createCommand(10_000), newKey());
       await h.service.authorize(ctxA, payment.id, newKey());
       const key = newKey();
@@ -424,7 +424,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('estorno com resultado desconhecido bloqueia o próximo até a reconciliação', async () => {
-      const h = harness();
+      const h = await harness();
       const { payment } = await h.service.createPayment(ctxA, createCommand(10_000), newKey());
       await h.service.authorize(ctxA, payment.id, newKey());
       h.scenario = { type: 'UNKNOWN_THEN_RECONCILED', hiddenOutcome: 'SUCCEEDED' };
@@ -441,7 +441,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
 
   describe(`[${backend.name}] isolamento e auditoria`, () => {
     it('outro tenant não lê nem opera o pagamento', async () => {
-      const h = harness();
+      const h = await harness();
       const { payment } = await h.service.createPayment(ctxA, createCommand(), newKey());
       await expect(h.service.getPayment(ctxB, payment.id)).rejects.toBeInstanceOf(NotFoundError);
       await expect(h.service.authorize(ctxB, payment.id, newKey())).rejects.toBeInstanceOf(NotFoundError);
@@ -450,7 +450,7 @@ export function describePaymentServiceSuite(backend: SuiteBackend): void {
     });
 
     it('a cadeia de auditoria do tenant é válida e não contém dados sensíveis', async () => {
-      const h = harness();
+      const h = await harness();
       const { payment } = await h.service.createPayment(ctxA, createCommand(), newKey());
       await h.service.authorize(ctxA, payment.id, newKey());
       await h.service.refund(ctxA, payment.id, money(500), newKey());

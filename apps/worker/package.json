@@ -1,0 +1,18 @@
+{
+  "name": "@tef/worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@tef/application": "0.0.0",
+    "@tef/domain": "0.0.0",
+    "@tef/observability": "0.0.0",
+    "@tef/persistence": "0.0.0",
+    "@tef/provider-contract": "0.0.0",
+    "@tef/provider-simulator": "0.0.0",
+    "zod": "4.6.7"
+  }
+}

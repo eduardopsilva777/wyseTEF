@@ -1,5 +1,18 @@
 import type { AuditEventInput, AuditRecord } from '@tef/audit';
-import type { MerchantId, Operation, OperationId, Payment, PaymentId, TenantId } from '@tef/domain';
+import type {
+  Customer,
+  Merchant,
+  MerchantId,
+  Operation,
+  OperationId,
+  Payment,
+  PaymentId,
+  PaymentState,
+  ProviderId,
+  TenantId,
+  Terminal,
+  TerminalId,
+} from '@tef/domain';
 
 /**
  * Portas de persistência. Regras que TODA implementação deve garantir (e que
@@ -66,8 +79,191 @@ export interface OutboxEvent {
   readonly occurredAt: Date;
 }
 
+export interface StoredOutboxEvent extends OutboxEvent {
+  readonly id: number;
+  readonly deliveryAttempts: number;
+}
+
 export interface OutboxRepository {
   add(event: OutboxEvent): Promise<void>;
+  /**
+   * Reivindica eventos ainda não publicados e vencidos, bloqueando-os até o fim da
+   * transação (FOR UPDATE SKIP LOCKED): dois publicadores nunca pegam o mesmo evento.
+   */
+  claimUnpublished(limit: number, now: Date): Promise<StoredOutboxEvent[]>;
+  markPublished(id: number, now: Date): Promise<void>;
+  markDeliveryFailed(id: number, nextAttemptAt: Date, errorCode: string): Promise<void>;
+  countUnpublished(): Promise<number>;
+}
+
+// ---------------------------------------------------------------------------
+// Fila durável de tarefas
+// ---------------------------------------------------------------------------
+
+export type JobKind = 'EXECUTE_OPERATION' | 'RECONCILE_OPERATION';
+export type JobStatus = 'PENDING' | 'RUNNING' | 'DONE' | 'FAILED';
+
+export interface Job {
+  readonly id: number;
+  readonly kind: JobKind;
+  readonly tenantId: TenantId;
+  readonly paymentId: PaymentId;
+  readonly operationId: OperationId;
+  readonly status: JobStatus;
+  readonly attempts: number;
+  readonly maxAttempts: number;
+  readonly availableAt: Date;
+  readonly leaseOwner: string | null;
+  readonly leaseExpiresAt: Date | null;
+  readonly lastErrorCode: string | null;
+  readonly createdAt: Date;
+  readonly updatedAt: Date;
+  readonly completedAt: Date | null;
+}
+
+export interface NewJob {
+  readonly kind: JobKind;
+  readonly tenantId: TenantId;
+  readonly paymentId: PaymentId;
+  readonly operationId: OperationId;
+  readonly availableAt: Date;
+  readonly maxAttempts: number;
+}
+
+export type RetryResult = 'RESCHEDULED' | 'FAILED' | 'LOST_LEASE';
+
+export interface JobRepository {
+  /** Não duplica: se já houver tarefa ativa do mesmo tipo para a operação, retorna `false`. */
+  enqueue(job: NewJob, now: Date): Promise<boolean>;
+  /**
+   * Reivindica tarefas PENDING vencidas ou RUNNING com lease expirado (worker que caiu),
+   * com FOR UPDATE SKIP LOCKED, e concede um novo lease ao `workerId`.
+   */
+  claim(workerId: string, limit: number, leaseMs: number, now: Date): Promise<Job[]>;
+  /**
+   * Fencing + renovação: estende o lease a partir de `now` SOMENTE se a tarefa ainda está
+   * RUNNING, pertence ao worker e o lease não expirou. Executada na mesma transação que
+   * age sobre a operação, garante que um worker que perdeu a posse não envie nada.
+   */
+  renewLease(jobId: number, workerId: string, leaseMs: number, now: Date): Promise<boolean>;
+  /** Conclui a tarefa; `false` se o lease já não pertence ao worker (fencing). */
+  complete(jobId: number, workerId: string, now: Date): Promise<boolean>;
+  /** Reagenda, ou marca FAILED ao atingir o máximo de tentativas. */
+  retryLater(jobId: number, workerId: string, availableAt: Date, errorCode: string, now: Date): Promise<RetryResult>;
+  /** Antecipa uma tarefa PENDING (ex.: "reconciliar agora" no painel). `false` se não houver. */
+  makeAvailableNow(operationId: OperationId, kind: JobKind, now: Date): Promise<boolean>;
+  countByStatus(): Promise<Record<JobStatus, number>>;
+  listByPayment(tenantId: TenantId, paymentId: PaymentId): Promise<Job[]>;
+}
+
+// ---------------------------------------------------------------------------
+// Cadastro
+// ---------------------------------------------------------------------------
+
+export interface CatalogListFilter {
+  readonly q?: string;
+  readonly status?: string;
+  readonly limit: number;
+}
+
+export interface Dependents {
+  readonly merchants: number;
+  readonly terminals: number;
+  readonly payments: number;
+}
+
+export interface CatalogRepository {
+  /** Lança DuplicateCodeError se o código já existir. */
+  insertCustomer(customer: Customer): Promise<void>;
+  findCustomer(id: TenantId): Promise<Customer | null>;
+  listCustomers(filter: CatalogListFilter): Promise<Customer[]>;
+  updateCustomer(customer: Customer, expectedVersion: number): Promise<void>;
+  deleteCustomer(id: TenantId): Promise<void>;
+  customerDependents(id: TenantId): Promise<Dependents>;
+
+  insertMerchant(merchant: Merchant): Promise<void>;
+  findMerchant(customerId: TenantId, id: MerchantId): Promise<Merchant | null>;
+  listMerchants(filter: CatalogListFilter & { readonly customerId?: TenantId }): Promise<Merchant[]>;
+  updateMerchant(merchant: Merchant, expectedVersion: number): Promise<void>;
+  deleteMerchant(customerId: TenantId, id: MerchantId): Promise<void>;
+  merchantDependents(customerId: TenantId, id: MerchantId): Promise<Dependents>;
+
+  insertTerminal(terminal: Terminal): Promise<void>;
+  findTerminal(customerId: TenantId, id: TerminalId): Promise<Terminal | null>;
+  listTerminals(filter: CatalogListFilter & { readonly customerId?: TenantId; readonly merchantId?: MerchantId }): Promise<Terminal[]>;
+  updateTerminal(terminal: Terminal, expectedVersion: number): Promise<void>;
+  deleteTerminal(customerId: TenantId, id: TerminalId): Promise<void>;
+  terminalDependents(customerId: TenantId, id: TerminalId): Promise<Dependents>;
+}
+
+// ---------------------------------------------------------------------------
+// Leituras do painel administrativo
+// ---------------------------------------------------------------------------
+
+export interface PeriodFilter {
+  readonly from?: Date;
+  readonly to?: Date;
+  readonly customerId?: TenantId;
+}
+
+export interface StateTotals {
+  readonly count: number;
+  readonly amountCents: number;
+  readonly reversedCents: number;
+}
+
+export interface DashboardData {
+  readonly byState: Readonly<Record<PaymentState, StateTotals>>;
+  readonly unknownOperations: number;
+  /** Somente os dias com pagamentos, chave AAAA-MM-DD no fuso America/Sao_Paulo. */
+  readonly daily: readonly DailyBucket[];
+}
+
+export interface DailyBucket {
+  readonly day: string;
+  readonly approved: number;
+  readonly declined: number;
+  readonly other: number;
+}
+
+export interface PaymentListFilter extends PeriodFilter {
+  readonly merchantId?: MerchantId;
+  readonly state?: PaymentState;
+  readonly q?: string;
+  readonly limit: number;
+}
+
+export interface AuditListFilter {
+  readonly tenantId?: TenantId;
+  readonly resourceType?: string;
+  readonly resourceId?: string;
+  readonly limit: number;
+}
+
+export interface ReportingRepository {
+  dashboard(filter: PeriodFilter, dailyWindow: { readonly from: Date; readonly to: Date }): Promise<DashboardData>;
+  listPayments(filter: PaymentListFilter): Promise<Payment[]>;
+  listAudit(filter: AuditListFilter): Promise<AuditRecord[]>;
+  auditChain(tenantId: TenantId): Promise<AuditRecord[]>;
+  listUnknownOperations(limit: number): Promise<Operation[]>;
+}
+
+/** Diretiva de cenário para o simulador (somente dados fictícios de teste). */
+export interface TestDirectiveRepository {
+  set(paymentId: PaymentId, providerId: ProviderId, directive: string, now: Date): Promise<void>;
+  get(paymentId: PaymentId): Promise<string | null>;
+}
+
+export interface WorkerHeartbeat {
+  readonly workerId: string;
+  readonly startedAt: Date;
+  readonly lastBeatAt: Date;
+  readonly status: 'RUNNING' | 'STOPPING' | 'STOPPED';
+}
+
+export interface WorkerHeartbeatRepository {
+  beat(heartbeat: WorkerHeartbeat): Promise<void>;
+  list(): Promise<WorkerHeartbeat[]>;
 }
 
 export interface Repositories {
@@ -76,6 +272,11 @@ export interface Repositories {
   readonly idempotency: IdempotencyRepository;
   readonly audit: AuditRepository;
   readonly outbox: OutboxRepository;
+  readonly jobs: JobRepository;
+  readonly catalog: CatalogRepository;
+  readonly reporting: ReportingRepository;
+  readonly testDirectives: TestDirectiveRepository;
+  readonly heartbeats: WorkerHeartbeatRepository;
 }
 
 export interface UnitOfWork {

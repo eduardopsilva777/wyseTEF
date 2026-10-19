@@ -36,6 +36,15 @@ export function uuidv7(now: number = Date.now()): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
+const UUID_V7_SUFFIX = new RegExp(`(?:^|_)(${UUID_V7})$`);
+
+/** Instante (ms) embutido num identificador UUIDv7 (com ou sem prefixo); `null` se não for UUIDv7. */
+export function uuidv7Timestamp(id: string): number | null {
+  const m = UUID_V7_SUFFIX.exec(id);
+  if (!m?.[1]) return null;
+  return parseInt(m[1].replace(/-/g, '').slice(0, 12), 16);
+}
+
 export function newPaymentId(): PaymentId {
   return `pay_${uuidv7()}` as PaymentId;
 }

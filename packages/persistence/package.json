@@ -9,9 +9,10 @@
     "./memory": "./src/memory/index.ts"
   },
   "dependencies": {
-    "@tef/domain": "0.0.0",
-    "@tef/audit": "0.0.0",
     "@tef/application": "0.0.0",
+    "@tef/audit": "0.0.0",
+    "@tef/domain": "0.0.0",
+    "@tef/provider-simulator": "0.0.0",
     "pg": "8.23.1"
   }
 }

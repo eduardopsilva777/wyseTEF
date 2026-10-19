@@ -83,6 +83,7 @@ export interface ProviderNotification {
 
 export interface ProviderRegistry {
   get(id: ProviderId): PaymentProvider;
+  list(): readonly PaymentProvider[];
 }
 
 export class UnknownProviderError extends Error {
@@ -96,6 +97,9 @@ export function createProviderRegistry(providers: readonly PaymentProvider[]): P
       const provider = byId.get(id);
       if (!provider) throw new UnknownProviderError(`provedor não registrado: ${id}`);
       return provider;
+    },
+    list() {
+      return [...providers];
     },
   };
 }

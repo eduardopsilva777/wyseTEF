@@ -1,5 +1,8 @@
 import type pg from 'pg';
 import { chainAuditEvent, GENESIS_HASH, type AuditRecord } from '@tef/audit';
+import { createPgCatalog } from './catalog.ts';
+import { createPgHeartbeats, createPgJobs, createPgTestDirectives } from './jobs.ts';
+import { createPgReporting } from './reporting.ts';
 import {
   ConcurrencyConflictError,
   DuplicateReferenceError,
@@ -44,13 +47,13 @@ function pgErrorInfo(error: unknown): { code?: string; constraint?: string } {
   return {};
 }
 
-function toSafeInt(value: string | number): number {
+export function toSafeInt(value: string | number): number {
   const n = typeof value === 'number' ? value : Number(value);
   if (!Number.isSafeInteger(n)) throw new Error('valor inteiro fora do intervalo seguro');
   return n;
 }
 
-interface PaymentRow {
+export interface PaymentRow {
   id: string;
   tenant_id: string;
   merchant_id: string;
@@ -67,7 +70,7 @@ interface PaymentRow {
   updated_at: Date;
 }
 
-interface OperationRow {
+export interface OperationRow {
   id: string;
   payment_id: string;
   tenant_id: string;
@@ -91,7 +94,7 @@ interface StoredEvidence {
   manual?: { resolvedBy: string; approvedBy: string; justification: string; supportingDocumentRef: string };
 }
 
-function toPayment(r: PaymentRow): Payment {
+export function toPayment(r: PaymentRow): Payment {
   return {
     id: r.id as PaymentId,
     tenantId: r.tenant_id as TenantId,
@@ -130,7 +133,7 @@ function fromEvidence(evidence: Evidence | null): string | null {
   return JSON.stringify(stored);
 }
 
-function toOperation(r: OperationRow): Operation {
+export function toOperation(r: OperationRow): Operation {
   return {
     id: r.id as OperationId,
     paymentId: r.payment_id as PaymentId,
@@ -353,22 +356,62 @@ export function createPgRepositories(db: Queryable): Repositories {
           [e.tenantId, e.aggregateType, e.aggregateId, e.eventType, JSON.stringify(e.payload), e.occurredAt],
         );
       },
+      async claimUnpublished(limit, now) {
+        const res = await db.query<{
+          id: string; tenant_id: string; aggregate_type: 'payment'; aggregate_id: string; event_type: string;
+          payload: Record<string, string | number | boolean | null>; occurred_at: Date; delivery_attempts: number;
+        }>(
+          `SELECT id, tenant_id, aggregate_type, aggregate_id, event_type, payload, occurred_at, delivery_attempts
+             FROM outbox_events
+            WHERE published_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at <= $1)
+            ORDER BY id LIMIT $2
+            FOR UPDATE SKIP LOCKED`,
+          [now, limit],
+        );
+        return res.rows.map((r) => ({
+          id: toSafeInt(r.id),
+          tenantId: r.tenant_id as TenantId,
+          aggregateType: r.aggregate_type,
+          aggregateId: r.aggregate_id as PaymentId,
+          eventType: r.event_type,
+          payload: r.payload,
+          occurredAt: r.occurred_at,
+          deliveryAttempts: r.delivery_attempts,
+        }));
+      },
+      async markPublished(id, now) {
+        await db.query(`UPDATE outbox_events SET published_at = $1, delivery_attempts = delivery_attempts + 1 WHERE id = $2`, [now, id]);
+      },
+      async markDeliveryFailed(id, nextAttemptAt, errorCode) {
+        await db.query(
+          `UPDATE outbox_events SET delivery_attempts = delivery_attempts + 1, next_attempt_at = $1, last_error_code = $2 WHERE id = $3`,
+          [nextAttemptAt, errorCode, id],
+        );
+      },
+      async countUnpublished() {
+        const res = await db.query<{ n: number }>(`SELECT count(*)::int AS n FROM outbox_events WHERE published_at IS NULL`);
+        return res.rows[0]?.n ?? 0;
+      },
     },
+    jobs: createPgJobs(db),
+    catalog: createPgCatalog(db),
+    reporting: createPgReporting(db),
+    testDirectives: createPgTestDirectives(db),
+    heartbeats: createPgHeartbeats(db),
   };
 }
 
-/** Leitura da cadeia de auditoria de um tenant, para verificação. */
-export async function loadAuditChain(db: Queryable, tenantId: string): Promise<AuditRecord[]> {
-  const res = await db.query<{
-    tenant_id: string; seq: string; occurred_at: Date; actor_type: AuditRecord['actorType']; actor_id: string;
-    action: string; resource_type: AuditRecord['resourceType']; resource_id: string; correlation_id: string | null;
-    data: AuditRecord['data']; prev_hash: string; hash: string;
-  }>(
-    `SELECT tenant_id, seq, occurred_at, actor_type, actor_id, action, resource_type, resource_id, correlation_id, data, prev_hash, hash
-       FROM audit_events WHERE tenant_id = $1 ORDER BY seq`,
-    [tenantId],
-  );
-  return res.rows.map((r) => ({
+export interface AuditRow {
+  tenant_id: string; seq: string; occurred_at: Date; actor_type: AuditRecord['actorType']; actor_id: string;
+  action: string; resource_type: AuditRecord['resourceType']; resource_id: string; correlation_id: string | null;
+  data: AuditRecord['data']; prev_hash: string; hash: string;
+}
+
+export const AUDIT_COLUMNS =
+  'tenant_id, seq, occurred_at, actor_type, actor_id, action, resource_type, resource_id, correlation_id, data, prev_hash, hash';
+
+export function toAuditRecord(r: AuditRow): AuditRecord {
+  return {
     tenantId: r.tenant_id,
     seq: toSafeInt(r.seq),
     occurredAt: r.occurred_at,
@@ -381,5 +424,11 @@ export async function loadAuditChain(db: Queryable, tenantId: string): Promise<A
     data: r.data,
     prevHash: r.prev_hash,
     hash: r.hash,
-  }));
+  };
+}
+
+/** Leitura da cadeia de auditoria de um tenant, para verificação. */
+export async function loadAuditChain(db: Queryable, tenantId: string): Promise<AuditRecord[]> {
+  const res = await db.query<AuditRow>(`SELECT ${AUDIT_COLUMNS} FROM audit_events WHERE tenant_id = $1 ORDER BY seq`, [tenantId]);
+  return res.rows.map(toAuditRecord);
 }

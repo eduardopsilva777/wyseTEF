@@ -1,5 +1,6 @@
 import { isApplicationError, type ApplicationErrorCode } from '@tef/application';
 import { isDomainError, type DomainErrorCode } from '@tef/domain';
+import { UnknownProviderError } from '@tef/provider-contract';
 
 export interface HttpErrorBody {
   readonly error: {
@@ -51,6 +52,11 @@ const APPLICATION_STATUS: Record<ApplicationErrorCode, number> = {
   CONCURRENCY_CONFLICT: 409,
   RECONCILIATION_REQUIRES_MANUAL_ACTION: 409,
   PROVIDER_MISMATCH: 422,
+  REFERENCE_INVALID: 422,
+  DUPLICATE_CODE: 409,
+  HAS_DEPENDENCIES: 409,
+  TEST_DIRECTIVE_NOT_ALLOWED: 422,
+  NOTHING_TO_RECONCILE: 409,
 };
 
 /** Converte qualquer erro em resposta segura. Erros inesperados viram 500 genérico. */
@@ -70,6 +76,9 @@ export function toHttpError(error: unknown, correlationId: string): { status: nu
   }
   if (isApplicationError(error)) {
     return { status: APPLICATION_STATUS[error.code], body: body(error.code, error.message), expected: true };
+  }
+  if (error instanceof UnknownProviderError) {
+    return { status: 422, body: body('UNKNOWN_PROVIDER', 'provedor não registrado'), expected: true };
   }
   const fastifyStatus = (error as { statusCode?: unknown } | null)?.statusCode;
   if (typeof fastifyStatus === 'number' && fastifyStatus >= 400 && fastifyStatus < 500) {

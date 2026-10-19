@@ -28,6 +28,8 @@ Cada provedor é um adaptador que implementa `PaymentProvider` (`packages/provid
 
 Cenários: aprovação (com ou sem confirmação), recusa, abandono no terminal, timeout antes do envio, timeout após envio, resposta atrasada (com notificação), falha de comunicação, resposta duplicada, desconhecido esclarecido por consulta.
 
+No painel local, o cenário é uma **diretiva de teste** gravada com o pagamento (`provider_test_directives`, aceita só para `SIMULATOR`); o worker a lê ao executar a autorização. O que o simulador "processou" fica no **livro durável** `simulator_ledger` (ADR 0016), para que consultas de qualquer processo, inclusive após reinício, vejam o mesmo resultado.
+
 Convenção para testes manuais (somente simulador, centavos finais do valor da autorização): `,51` recusa · `,52` abandono · `,53` timeout antes do envio · `,54` timeout após envio · `,55` resposta atrasada · `,56` falha de comunicação · `,57` resposta duplicada · `,58` desconhecido esclarecido por consulta · demais: aprovação.
 
 ## Informações necessárias (TouchPay e provedores)

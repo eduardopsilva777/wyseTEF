@@ -9,7 +9,10 @@
     "vitest.config.ts",
     "eslint.config.js"
   ],
-  "exclude": ["**/node_modules/**"],
+  "exclude": [
+    "**/node_modules/**",
+    "apps/web/**"
+  ],
   "compilerOptions": {
     "allowJs": true,
     "checkJs": false

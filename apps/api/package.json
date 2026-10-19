@@ -7,14 +7,14 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
-    "@tef/domain": "0.0.0",
     "@tef/application": "0.0.0",
     "@tef/audit": "0.0.0",
+    "@tef/domain": "0.0.0",
+    "@tef/observability": "0.0.0",
+    "@tef/persistence": "0.0.0",
     "@tef/provider-contract": "0.0.0",
     "@tef/provider-simulator": "0.0.0",
-    "@tef/persistence": "0.0.0",
     "fastify": "5.12.7",
-    "pino": "10.4.0",
     "zod": "4.6.7"
   }
 }

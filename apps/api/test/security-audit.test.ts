@@ -2,13 +2,14 @@ import { createHash, randomBytes } from 'node:crypto';
 import { Writable } from 'node:stream';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
-import { PaymentService, type UnitOfWork } from '@tef/application';
+import { OutboxPublisher, PaymentService, Worker, type UnitOfWork } from '@tef/application';
 import { InMemoryUnitOfWork } from '@tef/persistence/memory';
 import { createProviderRegistry, type PaymentProvider } from '@tef/provider-contract';
 import { PaymentSimulator, SIMULATOR_PROVIDER_ID } from '@tef/provider-simulator';
 import { buildApp } from '../src/app.ts';
 import { createAuthenticator } from '../src/auth.ts';
 import { createLogger } from '../src/logging.ts';
+import { seedCatalog } from '../../../tests/support/catalog.ts';
 
 /**
  * Regressões da auditoria pré-commit da F1: nenhum segredo de teste presente em
@@ -26,6 +27,7 @@ const SECRETS = () => [KEY_A, KEY_C, sha(KEY_A), DB_PASSWORD, TEST_PAN];
 interface Ctx {
   app: FastifyInstance;
   logs: string[];
+  work: () => Promise<void>;
 }
 
 const apps: FastifyInstance[] = [];
@@ -33,7 +35,7 @@ afterEach(async () => {
   await Promise.all(apps.splice(0).map((a) => a.close()));
 });
 
-function setup(options: { uow?: UnitOfWork; providers?: PaymentProvider[]; production?: boolean } = {}): Ctx {
+async function setup(options: { uow?: UnitOfWork; providers?: PaymentProvider[]; production?: boolean } = {}): Promise<Ctx> {
   const logs: string[] = [];
   const stream = new Writable({
     write(chunk: Buffer, _enc, cb) {
@@ -44,11 +46,17 @@ function setup(options: { uow?: UnitOfWork; providers?: PaymentProvider[]; produ
   const providerList = options.providers ?? [new PaymentSimulator()];
   const providers = createProviderRegistry(providerList);
   const logger = createLogger('debug', options.production ?? false, stream);
-  const service = new PaymentService({ uow: options.uow ?? new InMemoryUnitOfWork(), providers, providerTimeoutMs: 50, logger });
+  let uow = options.uow;
+  if (!uow) {
+    const memory = new InMemoryUnitOfWork();
+    await seedCatalog(memory);
+    uow = memory;
+  }
+  const service = new PaymentService({ uow, providers, providerTimeoutMs: 50, logger });
+  const worker = new Worker({ uow, service, publisher: new OutboxPublisher({ uow, sink: { deliver: () => Promise.resolve() } }), workerId: 'audit-worker', leaseMs: 5_000 });
   const app = buildApp({
     service,
     providers,
-    defaultProviderId: providerList[0]!.id,
     logger,
     authenticate: createAuthenticator([
       { keyId: 'key-a', keySha256: sha(KEY_A), tenantId: 'tenant-a', merchantIds: ['merchant-1', 'merchant-2'] },
@@ -56,7 +64,13 @@ function setup(options: { uow?: UnitOfWork; providers?: PaymentProvider[]; produ
     ]),
   });
   apps.push(app);
-  return { app, logs };
+  return {
+    app,
+    logs,
+    work: async () => {
+      await worker.runOnce();
+    },
+  };
 }
 
 function expectNoSecrets(text: string): void {
@@ -66,9 +80,10 @@ function expectNoSecrets(text: string): void {
 
 let n = 0;
 const idem = () => `audit-key-${++n}-${Date.now()}`;
-const createBody = (merchantId = 'merchant-1') => ({
+const createBody = (merchantId = 'merchant-1', extra: Record<string, unknown> = {}) => ({
   merchantId,
-  terminalId: 'terminal-1',
+  terminalId: merchantId === 'merchant-2' ? 'terminal-2' : 'terminal-1',
+  ...extra,
   externalReference: `ref-${++n}`,
   amount: { cents: 1_000, currency: 'BRL' },
 });
@@ -87,7 +102,7 @@ describe('auditoria: erros inesperados não vazam segredos', () => {
     const error = new Error(
       `connect failed for ${DB_URL} using Authorization: Bearer ${KEY_A} card=${TEST_PAN} hash ${sha(KEY_A)}`,
     );
-    const { app, logs } = setup({ uow: failingUow(error) });
+    const { app, logs } = await setup({ uow: failingUow(error) });
     const res = await app.inject({
       method: 'POST',
       url: '/v1/payments',
@@ -120,7 +135,7 @@ describe('auditoria: erros inesperados não vazam segredos', () => {
       query: `INSERT INTO t VALUES ('${DB_PASSWORD}')`,
       parameters: [KEY_A, TEST_PAN],
     });
-    const { app, logs } = setup({ uow: failingUow(pgLike) });
+    const { app, logs } = await setup({ uow: failingUow(pgLike) });
     const res = await app.inject({
       method: 'POST',
       url: '/v1/payments',
@@ -138,7 +153,7 @@ describe('auditoria: erros inesperados não vazam segredos', () => {
   });
 
   it('em produção o stack não é registrado', async () => {
-    const { app, logs } = setup({ uow: failingUow(new Error(`boom ${DB_URL}`)), production: true });
+    const { app, logs } = await setup({ uow: failingUow(new Error(`boom ${DB_URL}`)), production: true });
     await app.inject({
       method: 'POST',
       url: '/v1/payments',
@@ -151,7 +166,7 @@ describe('auditoria: erros inesperados não vazam segredos', () => {
   });
 
   it('JSON malformado contendo segredos: 400 genérico, sem eco na resposta nem no log', async () => {
-    const { app, logs } = setup();
+    const { app, logs } = await setup();
     const res = await app.inject({
       method: 'POST',
       url: '/v1/payments',
@@ -164,7 +179,7 @@ describe('auditoria: erros inesperados não vazam segredos', () => {
   });
 
   it('erro de validação Zod não ecoa valores', async () => {
-    const { app, logs } = setup();
+    const { app, logs } = await setup();
     const res = await app.inject({
       method: 'POST',
       url: '/v1/payments',
@@ -194,23 +209,21 @@ describe('auditoria: resultado do provedor é normalizado antes de persistir e r
         return Promise.resolve({ status: 'NOT_FOUND' });
       },
     };
-    const { app, logs } = setup({ providers: [leaky] });
+    const { app, logs, work } = await setup({ providers: [leaky] });
     const created = await app.inject({
       method: 'POST',
       url: '/v1/payments',
       headers: { authorization: `Bearer ${KEY_A}`, 'idempotency-key': idem() },
       payload: createBody(),
     });
+    expect(created.statusCode).toBe(202);
     const id = created.json<{ id: string }>().id;
-    const res = await app.inject({
-      method: 'POST',
-      url: `/v1/payments/${id}/authorize`,
-      headers: { authorization: `Bearer ${KEY_A}`, 'idempotency-key': idem() },
-    });
+    await work();
+    const res = await app.inject({ method: 'GET', url: `/v1/payments/${id}`, headers: { authorization: `Bearer ${KEY_A}` } });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toMatchObject({
-      payment: { state: 'DECLINED' },
-      operation: { status: 'REJECTED', resultCode: 'PROVIDER_CODE_INVALID', providerReference: null },
+      state: 'DECLINED',
+      operations: [{ status: 'REJECTED', resultCode: 'PROVIDER_CODE_INVALID', providerReference: null }],
     });
     expectNoSecrets(res.body);
     expectNoSecrets(logs.join(''));
@@ -219,7 +232,7 @@ describe('auditoria: resultado do provedor é normalizado antes de persistir e r
 
 describe('auditoria: autenticação e exposição', () => {
   it('sem credencial: 401 antes de qualquer outra validação (inclusive ID malformado)', async () => {
-    const { app } = setup();
+    const { app } = await setup();
     for (const [method, url] of [
       ['GET', '/v1/payments/id-malformado'],
       ['POST', '/v1/payments/id-malformado/authorize'],
@@ -231,7 +244,7 @@ describe('auditoria: autenticação e exposição', () => {
   });
 
   it('credencial ausente e inválida recebem a mesma resposta', async () => {
-    const { app } = setup();
+    const { app } = await setup();
     const missing = await app.inject({ method: 'GET', url: '/v1/payments/x', headers: { 'x-correlation-id': 'corr-same-0001' } });
     const invalid = await app.inject({
       method: 'GET',
@@ -244,12 +257,12 @@ describe('auditoria: autenticação e exposição', () => {
   });
 
   it('mesmo tenant, estabelecimento não autorizado: 404 em consulta e em todas as operações', async () => {
-    const { app } = setup();
+    const { app } = await setup();
     const created = await app.inject({
       method: 'POST',
       url: '/v1/payments',
       headers: { authorization: `Bearer ${KEY_A}`, 'idempotency-key': idem() },
-      payload: createBody('merchant-2'),
+      payload: createBody('merchant-2', { authorize: false }),
     });
     expect(created.statusCode).toBe(201);
     const id = created.json<{ id: string }>().id;

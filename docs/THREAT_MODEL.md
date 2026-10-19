@@ -1,6 +1,6 @@
 # Modelo de ameaças (versão F1)
 
-> Escopo: núcleo transacional, API e persistência implementados na F1. Revisar a cada fase e antes de qualquer piloto.
+> Escopo: núcleo transacional, API, worker, painel local e persistência (F1 + F2A). Revisar a cada fase e antes de qualquer piloto.
 > Este documento **não** é uma avaliação PCI e não declara conformidade.
 
 ## Ativos
@@ -35,11 +35,18 @@ Integrador ↔ API (internet) · API ↔ PostgreSQL · API ↔ provedor (futuro)
 | T13 | Abuso de operador (resolução manual) | Dupla aprovação por pessoas distintas, justificativa e documento obrigatórios, auditados | Rota administrativa com MFA e RBAC |
 | T14 | Comprometimento do agente ou da atualização (futuro) | — | Atualização assinada, mTLS por agente, revogação, SBOM |
 | T15 | Processo local malicioso chamando o agente (futuro) | — | Pareamento PDV↔agente, token por instalação, ACL |
+| T16 | Painel local usado por terceiros ou exposto em rede | Rotas /admin só existem com token configurado; recusado em produção; API e Vite só em loopback (configuração recusa outro HOST); limite de tentativas de login | Autenticação de produção com contas, MFA, RBAC (ADR 0015) |
+| T17 | CSRF / uso da sessão por outra origem | Cookie HttpOnly + SameSite=Strict + Path=/admin; cabeçalho obrigatório x-tef-admin; Origin restrito a origens locais; sem CORS | — |
+| T18 | Segredo embutido no JavaScript do painel | Nenhuma variável de ambiente exposta (envPrefix não usado, sem VITE_); token digitado e validado no servidor; teste estático e verificação do bundle (`check:web`) comparando valores reais do .env | — |
+| T19 | Cobrança duplicada por worker que caiu ou tarefa entregue duas vezes | PENDING→IN_FLIGHT uma única vez sob bloqueio; IN_FLIGHT encontrado vira UNKNOWN; lease renovado com verificação de posse na mesma transação do envio (worker que perdeu a posse não age); tarefa ativa única por operação; testado com 3 workers no PostgreSQL | Sincronização de relógio entre hosts (lease usa relógio da aplicação) |
+| T20 | Resultado falso por estado perdido do provedor (simulador entre processos/reinícios) | Livro durável do simulador no PostgreSQL com escopo de autoridade (operações anteriores ao livro nunca viram "não enviado"); a API nunca chama o provedor (ADR 0016) | Para provedores reais: depende da consulta oficial |
+| T21 | Acesso entre clientes pelo painel | Rotas escopadas por /customers/{id}; consultas por cliente; FKs compostas; testes de isolamento | Operador local é global por definição (ADR 0015) |
 
 ## Riscos residuais aceitos na F1
 - Autenticação provisória (T10); sem rate limiting (T11) — mitigado na F1 pela escuta somente em loopback.
 - A redação de texto livre é heurística: reduz, mas não elimina, o risco de uma biblioteca colocar dado sensível numa mensagem de erro.
 - Workflow de CI usa actions por tag de versão (não por SHA) e nunca foi executado.
+- O operador do painel local enxerga todos os clientes; não há usuários individuais nem trilha por pessoa.
 - Auditoria detecta, mas não impede, reescrita por superusuário (T9).
 - Ambiente de desenvolvimento usa PostgreSQL com usuário dono das tabelas.
 

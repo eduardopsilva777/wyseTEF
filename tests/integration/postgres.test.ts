@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { verifyAuditChain } from '@tef/audit';
 import { createPgPool, createPgRepositories, loadAuditChain, migrate, PgUnitOfWork } from '@tef/persistence/postgres';
 import { createCommand, createHarness, ctxA, newKey, TENANT_A, TENANT_B } from '../support/harness.ts';
+import { seedCatalog } from '../support/catalog.ts';
 import { describePaymentServiceSuite } from '../support/service-suite.ts';
 
 /**
@@ -28,7 +29,8 @@ describe.skipIf(!url)('PostgreSQL', () => {
     pool = createPgPool({ connectionString: url!, searchPath: schema, max: 10 });
     uow = new PgUnitOfWork(pool);
     const result = await migrate(pool);
-    expect(result.applied).toEqual(['0001_initial_schema.sql']);
+    expect(result.applied).toEqual(['0001_initial_schema.sql', '0002_catalog_jobs_outbox.sql', '0003_simulator_ledger.sql', '0004_simulator_ledger_scope.sql']);
+    await seedCatalog(uow);
   });
 
   afterAll(async () => {
@@ -41,7 +43,7 @@ describe.skipIf(!url)('PostgreSQL', () => {
     it('são idempotentes', async () => {
       const again = await migrate(pool);
       expect(again.applied).toEqual([]);
-      expect(again.alreadyApplied).toEqual(['0001_initial_schema.sql']);
+      expect(again.alreadyApplied).toEqual(['0001_initial_schema.sql', '0002_catalog_jobs_outbox.sql', '0003_simulator_ledger.sql', '0004_simulator_ledger_scope.sql']);
     });
 
     it('detectam migração alterada depois de aplicada', async () => {

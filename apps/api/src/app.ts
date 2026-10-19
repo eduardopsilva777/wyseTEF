@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import Fastify, { LogController, type FastifyBaseLogger, type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { isValidIdempotencyKey, type PaymentService, type PaymentView, type RequestContext } from '@tef/application';
+import { isValidIdempotencyKey, type AdminService, type PaymentService, type PaymentView, type RequestContext } from '@tef/application';
 import {
   parseExternalReference,
   parseMerchantId,
@@ -9,20 +9,26 @@ import {
   parseTerminalId,
   positiveMoney,
   type PaymentId,
-  type ProviderId,
 } from '@tef/domain';
 import type { ProviderRegistry } from '@tef/provider-contract';
+import type { DevAdminAuth } from './admin-auth.ts';
+import { registerAdminRoutes } from './admin-routes.ts';
 import type { Principal } from './auth.ts';
-import { HttpError, RequestValidationError, toHttpError } from './http-errors.ts';
+import { HttpError, toHttpError } from './http-errors.ts';
 import { presentOperation, presentPayment } from './presenters.ts';
+import { parse } from './validation.ts';
 
 export interface AppDeps {
   readonly service: PaymentService;
   readonly providers: ProviderRegistry;
-  /** Provedor usado para novos pagamentos (nesta fase, apenas o simulador). */
-  readonly defaultProviderId: ProviderId;
   readonly authenticate: (authorization: string | undefined) => Principal | null;
   readonly logger: FastifyBaseLogger;
+  /** Painel administrativo local; ausente = rotas /admin/api não existem. */
+  readonly admin?: {
+    readonly auth: DevAdminAuth;
+    readonly service: AdminService;
+    readonly allowedOrigins: readonly string[];
+  };
 }
 
 declare module 'fastify' {
@@ -43,18 +49,12 @@ const createPaymentSchema = z.object({
   terminalId: z.string(),
   externalReference: z.string(),
   amount: amountSchema,
+  /** Padrão `true`: a autorização é enfileirada e a resposta é 202 Accepted. */
+  authorize: z.boolean().optional(),
 }).strict();
 
 const refundSchema = z.object({ amount: amountSchema }).strict();
 const paymentParamsSchema = z.object({ paymentId: z.string() });
-
-function parse<T>(schema: z.ZodType<T>, value: unknown): T {
-  const result = schema.safeParse(value);
-  if (!result.success) {
-    throw new RequestValidationError(result.error.issues.map((i) => ({ path: i.path.join('.'), code: i.code })));
-  }
-  return result.data;
-}
 
 function requireIdempotencyKey(request: FastifyRequest): string {
   const key = request.headers['idempotency-key'];
@@ -176,7 +176,7 @@ export function buildApp(deps: AppDeps): FastifyInstance {
         terminalId: parseTerminalId(body.terminalId),
         externalReference: parseExternalReference(body.externalReference),
         amount: positiveMoney(body.amount.cents, body.amount.currency),
-        providerId: deps.defaultProviderId,
+        authorize: body.authorize ?? true,
       },
       key,
     );
@@ -195,7 +195,8 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     return sendView(reply, 200, view, false);
   });
 
-  const operationRoute = (path: string, run: (ctx: RequestContext, id: PaymentId, key: string, body: unknown) => ReturnType<PaymentService['authorize']>) => {
+  // Operações são aceitas para processamento assíncrono (202): o worker as executa.
+  const operationRoute = (path: string, run: (ctx: RequestContext, id: PaymentId, key: string, body: unknown) => ReturnType<PaymentService['requestOperation']>) => {
     app.post(`/v1/payments/:paymentId/${path}`, async (request, reply) => {
       const paymentId = parsePaymentIdParam(request.params);
       const key = requireIdempotencyKey(request);
@@ -209,14 +210,24 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     });
   };
 
-  operationRoute('authorize', (ctx, id, key) => deps.service.authorize(ctx, id, key));
-  operationRoute('confirm', (ctx, id, key) => deps.service.confirm(ctx, id, key));
-  operationRoute('undo', (ctx, id, key) => deps.service.undo(ctx, id, key));
-  operationRoute('cancel', (ctx, id, key) => deps.service.cancel(ctx, id, key));
+  operationRoute('authorize', (ctx, id, key) => deps.service.requestOperation(ctx, id, 'AUTHORIZATION', undefined, key));
+  operationRoute('confirm', (ctx, id, key) => deps.service.requestOperation(ctx, id, 'CONFIRMATION', undefined, key));
+  operationRoute('undo', (ctx, id, key) => deps.service.requestOperation(ctx, id, 'UNDO', undefined, key));
+  operationRoute('cancel', (ctx, id, key) => deps.service.requestOperation(ctx, id, 'CANCELLATION', undefined, key));
   operationRoute('refunds', (ctx, id, key, rawBody) => {
     const body = parse(refundSchema, rawBody);
-    return deps.service.refund(ctx, id, positiveMoney(body.amount.cents, body.amount.currency), key);
+    return deps.service.requestOperation(ctx, id, 'REFUND', positiveMoney(body.amount.cents, body.amount.currency), key);
   });
+
+  if (deps.admin) {
+    registerAdminRoutes(app, {
+      auth: deps.admin.auth,
+      admin: deps.admin.service,
+      payments: deps.service,
+      providers: deps.providers,
+      allowedOrigins: deps.admin.allowedOrigins,
+    });
+  }
 
   return app;
 }

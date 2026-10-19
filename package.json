@@ -2,32 +2,42 @@
   "name": "tef-platform",
   "private": true,
   "type": "module",
-  "description": "Plataforma de orquestração de pagamentos (TEF) — Fase 1: fundação e núcleo transacional. Nenhuma integração real com adquirentes.",
+  "description": "Plataforma de orquestração de pagamentos (TEF) — MVP local (Fase 2A): API assíncrona, worker e painel. Nenhuma integração real com adquirentes.",
   "engines": {
     "node": ">=24.0.0 <25"
   },
   "workspaces": [
     "packages/domain",
     "packages/audit",
+    "packages/observability",
     "packages/application",
     "packages/providers/contract",
     "packages/providers/simulator",
     "packages/persistence",
-    "apps/api"
+    "apps/api",
+    "apps/worker",
+    "apps/web"
   ],
   "scripts": {
-    "typecheck": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json && tsc -p apps/web/tsconfig.json",
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:db": "node scripts/test-db.mjs",
     "db:up": "docker compose -f infra/dev/docker-compose.yml --env-file .env up -d --wait",
     "db:down": "docker compose -f infra/dev/docker-compose.yml --env-file .env down",
-    "db:migrate": "node packages/persistence/src/cli/migrate.ts",
+    "db:migrate": "node --env-file-if-exists=.env packages/persistence/src/cli/migrate.ts",
     "dev:api": "node --watch apps/api/src/main.ts",
     "check:secrets": "node scripts/check-secrets.mjs",
     "check:deps": "npm audit --audit-level=moderate",
-    "verify": "npm run lint && npm run typecheck && npm run test && npm run check:secrets && npm run check:deps"
+    "verify": "npm run lint && npm run typecheck && npm run test && npm run check:web && npm run check:secrets && npm run check:deps",
+    "dev:worker": "node --watch apps/worker/src/main.ts",
+    "dev:web": "npm run dev --workspace @tef/web",
+    "build:web": "npm run build --workspace @tef/web",
+    "db:seed": "node --env-file-if-exists=.env packages/persistence/src/cli/seed.ts",
+    "dev": "node scripts/dev.mjs",
+    "dev:setup": "node scripts/dev-setup.mjs",
+    "check:web": "node scripts/check-web-bundle.mjs"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

@@ -1,71 +1,82 @@
 # TEF Platform
 
-Plataforma de orquestração de pagamentos (TEF) — **Fase 1: fundação e núcleo transacional.**
+Plataforma de orquestração de pagamentos (TEF): **Fase 2A, MVP local** com API assíncrona, worker, PostgreSQL e painel web.
 
-> **Aviso:** não há integração com adquirentes ou provedores reais. O único provedor é o **SIMULATOR**, com dados fictícios.
-> A plataforma não é homologada, certificada nem conforme ao PCI, e não está pronta para produção.
+> **Aviso:** não há integração com adquirentes ou provedores reais. O único provedor é o **SIMULATOR**, com dados fictícios. Nenhum pagamento é real.
+> A plataforma não é homologada, certificada nem conforme ao PCI, e não está pronta para produção. O acesso ao painel é exclusivo do ambiente de desenvolvimento local.
 
-## Requisitos
+## Pré-requisitos
 - Node.js 24 (testado com 24.21.0) e npm 11.
-- Docker com Compose (só para PostgreSQL de desenvolvimento e testes de integração).
+- Docker com Compose (PostgreSQL 18 de desenvolvimento).
+- Portas livres em 127.0.0.1: 3000 (API), 3001 (health do worker), 5173 (painel), 55432 (PostgreSQL).
 
-## Instalação
+## Primeira execução
 ```bash
 npm install
-cp .env.example .env      # PowerShell: Copy-Item .env.example .env
-# edite .env: defina POSTGRES_PASSWORD (local) e TEF_API_CREDENTIALS
+npm run dev:setup   # cria o .env com segredos aleatórios e mostra UMA vez o token do painel e a chave de API
+npm run dev         # sobe PostgreSQL, aplica migrações e inicia API, worker e painel
+npm run db:seed     # opcional, em outro terminal: dados fictícios de demonstração
 ```
 
-Gerar uma chave de API local e o hash que vai no `.env`:
-```bash
-node -e "const c=require('crypto');const k=c.randomBytes(32).toString('base64url');console.log('chave:',k);console.log('sha256:',c.createHash('sha256').update(k).digest('hex'))"
-```
-Guarde a chave fora do repositório. No `.env` vai apenas o `sha256`.
+Guarde o token exibido pelo `dev:setup`: ele não fica gravado em lugar nenhum (o `.env` tem só o SHA-256). Para gerar outro: `npm run dev:setup -- --rotate-admin-token` (ou `--rotate-api-key` para a chave de integração) e reinicie a API.
+
+| Componente | Endereço local |
+|---|---|
+| **Painel** | **http://127.0.0.1:5173** |
+| API | http://127.0.0.1:3000 (health: `/health`) |
+| Worker | http://127.0.0.1:3001/health |
+| PostgreSQL | 127.0.0.1:55432 |
+
+Tudo escuta apenas em loopback; a configuração recusa outros endereços nesta fase.
 
 ## Comandos
 
 | Comando | O que faz |
 |---|---|
-| `npm run lint` | ESLint com regras que exigem tipos |
-| `npm run typecheck` | `tsc` em modo strict (sem emissão) |
+| `npm run dev` | Ambiente completo (Ctrl+C encerra) |
+| `npm run dev:api` / `dev:worker` / `dev:web` | Cada componente separadamente (carregue o `.env` no shell para API e worker) |
+| `npm run db:up` / `db:down` | Sobe/derruba o PostgreSQL de desenvolvimento |
+| `npm run db:migrate` | Aplica migrações (lê o `.env`) |
+| `npm run db:seed` | Insere dados fictícios; nunca apaga nem altera dados existentes; rodar de novo não duplica |
+| `npm run lint` / `typecheck` | ESLint (com tipos) e TypeScript strict (backend e painel) |
 | `npm test` | Todos os testes; os de PostgreSQL aparecem como *skipped* sem banco |
-| `npm run db:up` / `npm run db:down` | Sobe/derruba o PostgreSQL 18 de desenvolvimento (`infra/dev`, porta local 55432) |
-| `npm run test:db` | Testes de integração com PostgreSQL real (exige `db:up` e `.env`, ou `TEST_DATABASE_URL`) |
-| `npm run db:migrate` | Aplica migrações em `DATABASE_URL` |
-| `npm run dev:api` | Sobe a API com recarga (`node --watch`, TypeScript executado pelo Node 24) |
-| `npm run check:secrets` | Varredura de segredos e de números que parecem cartão |
-| `npm run check:deps` | `npm audit` |
-| `npm run verify` | lint + tipos + testes + segredos + dependências |
+| `npm run test:db` | Testes de integração com PostgreSQL real (exige `db:up`) |
+| `npm run check:web` | Gera o bundle do painel e procura segredos nele |
+| `npm run check:secrets` / `check:deps` | Varredura de segredos no repositório / `npm audit` |
+| `npm run verify` | lint + tipos + testes + bundle + segredos + dependências |
 
-Executar a API localmente:
-```bash
-npm run db:up
-# carregue as variáveis do .env no shell (bash: set -a; . ./.env; set +a)
-npm run db:migrate
-npm run dev:api
-```
-Sem Docker, use `TEF_PERSISTENCE=memory` (só desenvolvimento; os dados somem ao reiniciar).
-Nesta fase a API só aceita `HOST` em loopback (127.0.0.1, ::1, localhost); não exponha a porta em rede.
+## Roteiro rápido no painel
+1. **Entrar:** cole o token do painel.
+2. **Cadastrar:** Clientes → *Cadastrar cliente* (ex.: código `padaria-aurora`); Estabelecimentos → *Cadastrar estabelecimento*; Terminais → *Cadastrar terminal* (sempre simulado).
+3. **Pagar:** Simulador → escolha cliente, estabelecimento, terminal, valor e cenário → *Criar pagamento simulado*. O resultado se atualiza sozinho conforme o worker processa a fila.
+4. **Recusa:** cenário *Recusa* → estado final **Recusado**.
+5. **Timeout:** cenário *Timeout após possível envio* → **Resultado desconhecido** por alguns segundos (nada é cobrado de novo) e depois **Aprovado**, com evidência "consulta ao provedor". *Timeout antes do envio* termina **Cancelado** (não enviado).
+6. **Reconciliação:** cenário *Falha de comunicação após envio* → **Resultado desconhecido** e depois **Recusado** pela consulta. Em Transações, um pagamento em resultado desconhecido mostra *Reconciliar agora*, que antecipa a consulta feita pelo worker.
+7. **Acompanhar:** Dashboard (indicadores do banco), Transações (detalhe com trilha de estados, operações, evidências e tarefas) e Auditoria (eventos e verificação da cadeia).
 
-Exemplo:
+## API de integração (exemplo)
 ```bash
 curl -X POST http://127.0.0.1:3000/v1/payments \
   -H "authorization: Bearer $TEF_KEY" -H "idempotency-key: pedido-1-criar" \
   -H "content-type: application/json" \
-  -d '{"merchantId":"merchant-dev","terminalId":"t-1","externalReference":"pedido-1","amount":{"cents":1000,"currency":"BRL"}}'
+  -d '{"merchantId":"loja-centro","terminalId":"caixa-01","externalReference":"pedido-1","amount":{"cents":1000,"currency":"BRL"}}'
+# 202 Accepted: estado PROCESSING, operação PENDING; consulte com GET /v1/payments/{id}
 ```
-Cenários do simulador por centavos: veja `docs/INTEGRATIONS.md`.
+A chave `$TEF_KEY` é a exibida pelo `dev:setup` (cliente `demo-mercado`, criado pelo `db:seed`).
 
 ## Estrutura
 ```
-apps/api                      API HTTP (Fastify)
-packages/domain               Domínio puro: Money, IDs, máquina de estados, evidências
-packages/application          Casos de uso e portas
+apps/api                      API HTTP (integração /v1 e painel /admin/api)
+apps/worker                   Worker: fila durável, outbox, health check
+apps/web                      Painel React + Vite (somente local)
+packages/domain               Domínio puro: Money, IDs, máquina de estados, cadastro
+packages/application          Casos de uso, worker e portas
 packages/providers/contract   Contrato de provedores + suíte de conformidade
-packages/providers/simulator  Adaptador SIMULATOR
-packages/persistence          PostgreSQL (migrações, repositórios) e implementação em memória para testes
-packages/audit                Auditoria encadeada por hash e sanitização
-tests/                        Suíte do serviço (memória e PostgreSQL) e utilitários
+packages/providers/simulator  Adaptador SIMULATOR e livro do simulador
+packages/persistence          PostgreSQL (migrações, repositórios, CLIs) e implementação em memória para testes
+packages/audit                Auditoria encadeada, sanitização e redação
+packages/observability        Logger sanitizado
+tests/                        Suítes de serviço, assíncrona, integração e segurança
 docs/                         Produto, arquitetura, ameaças, ciclo de vida, integrações, testes, roadmap, ADRs
 infra/dev                     docker-compose de desenvolvimento
 ```

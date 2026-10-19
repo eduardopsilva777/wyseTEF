@@ -1,6 +1,6 @@
 # 0012 — Chamada ao provedor dentro da requisição na F1
 
-- **Status:** Provisória (substituir antes da integração presencial real)
+- **Status:** Substituída pela [0013](0013-modelo-assincrono-fila-duravel.md) na Fase 2A
 - **Data:** 2026-10-18
 
 ## Decisão

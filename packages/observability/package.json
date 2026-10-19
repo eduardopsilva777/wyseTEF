@@ -1,0 +1,13 @@
+{
+  "name": "@tef/observability",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@tef/audit": "0.0.0",
+    "pino": "10.4.0"
+  }
+}

@@ -1,6 +1,6 @@
 # Product Brief — TEF Platform
 
-> Situação em 2026-10-18: **Fase 1 (fundação)**. Nenhuma integração real, nenhum pagamento real, nenhuma homologação.
+> Situação em 2026-10-18: **Fase 2A (MVP local)**. Nenhuma integração real, nenhum pagamento real, nenhuma homologação.
 > Este documento descreve objetivos, não funcionalidades existentes.
 
 ## Objetivo
@@ -20,13 +20,15 @@ Plataforma própria de orquestração de pagamentos (TEF), para licenciamento à
 3. Arquitetura de adaptadores por provedor, com capacidades declaradas.
 4. Auditoria, conciliação e isolamento entre clientes e estabelecimentos.
 
-## Escopo atual (F1) — implementado
+## Escopo atual — implementado
 - Núcleo transacional (domínio, máquina de estados, idempotência, persistência PostgreSQL, auditoria, outbox).
-- API HTTP mínima com autenticação provisória.
+- API de integração assíncrona (202) com autenticação provisória; worker com fila durável.
+- Cadastro de clientes, estabelecimentos e terminais simulados.
+- Painel web local (dashboard, cadastro, transações, simulador, auditoria) com acesso de desenvolvimento.
 - Adaptador **SIMULATOR** (dados fictícios).
 
 ## Fora de escopo nesta fase
-Conexão com adquirentes ou provedores reais; pinpads; agente local; painel administrativo; emissão fiscal; Pix; SDK público.
+Conexão com adquirentes ou provedores reais; pinpads; agente local; autenticação de produção (usuários, MFA, RBAC); emissão fiscal; Pix; SDK público; hospedagem fora da máquina local.
 
 ## Dependências comerciais em aberto
 - Quais provedores/adquirentes têm contrato e sandbox disponíveis para a AMLABS/TouchPay.

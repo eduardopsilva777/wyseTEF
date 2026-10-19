@@ -3,7 +3,7 @@ import js from '@eslint/js';
 import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
-  { ignores: ['**/node_modules/**', 'coverage/**', 'dist/**'] },
+  { ignores: ['**/node_modules/**', '**/coverage/**', '**/dist/**'] },
   js.configs.recommended,
   ...tseslint.configs.recommendedTypeChecked,
   {
@@ -52,12 +52,12 @@ export default tseslint.config(
     rules: { '@typescript-eslint/require-await': 'off' },
   },
   {
-    files: ['scripts/**/*.mjs', 'packages/persistence/src/cli/**/*.ts', 'apps/api/src/main.ts'],
+    files: ['scripts/**/*.mjs', 'packages/persistence/src/cli/**/*.ts', 'apps/api/src/main.ts', 'apps/worker/src/main.ts'],
     rules: { 'no-console': 'off' },
   },
   {
     files: ['scripts/**/*.mjs', 'eslint.config.js'],
     ...tseslint.configs.disableTypeChecked,
-    languageOptions: { globals: { process: 'readonly', console: 'readonly', URL: 'readonly' } },
+    languageOptions: { globals: { process: 'readonly', console: 'readonly', URL: 'readonly', setTimeout: 'readonly' } },
   },
 );
