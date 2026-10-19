@@ -27,8 +27,13 @@ describe('painel web: ausência de segredos e exposição local', () => {
     for (const f of files) {
       const content = readFileSync(f, 'utf8');
       expect(content, f).not.toMatch(/TEF_DEV_ADMIN_TOKEN_SHA256|TEF_API_CREDENTIALS|DATABASE_URL|POSTGRES_PASSWORD|keySha256/);
-      expect(content, f).not.toMatch(/localStorage|sessionStorage|document\.cookie/);
+      expect(content, f).not.toMatch(/sessionStorage|document\.cookie|indexedDB/);
+      // Único uso permitido de armazenamento local: a preferência de tema (sem dados de negócio).
+      if (!f.endsWith('theme.ts')) expect(content, f).not.toMatch(/localStorage/);
     }
+    const theme = readFileSync(join(WEB, 'src', 'theme.ts'), 'utf8');
+    expect([...theme.matchAll(/localStorage\.(\w+)\(([^,)]+)/g)].map((m) => m[2])).toEqual(['THEME_KEY', 'THEME_KEY']);
+    expect(theme).toMatch(/const THEME_KEY = 'wysetef-theme';/);
   });
 
   it('só chama a API administrativa relativa (mesma origem, via proxy local)', () => {
@@ -64,8 +69,10 @@ describe('painel web: falhas de carregamento sempre comunicadas', () => {
     expect(missing).toEqual([]);
   });
 
-  it('a atualização periódica continua após uma falha transitória', () => {
+  it('toda carga de dados tenta de novo após uma falha transitória (com ou sem atualização periódica)', () => {
     const ui = readFileSync(join(WEB, 'src', 'components', 'ui.tsx'), 'utf8');
-    expect(ui).toMatch(/setError\(e\);[\s\S]{0,200}if \(options\.pollMs\) timer = setTimeout/);
+    // A nova tentativa não pode depender de `pollMs`: telas sem atualização periódica também se recuperam.
+    expect(ui).toMatch(/setError\(e\);[\s\S]{0,200}\n\s*timer = setTimeout\(\(\) => run\(false\), options\.pollMs \?\? RETRY_MS\);/);
+    expect(ui).toMatch(/const RETRY_MS = \d+_?\d*;/);
   });
 });

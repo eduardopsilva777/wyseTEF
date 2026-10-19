@@ -91,3 +91,13 @@ export const ACTION_LABEL: Record<string, string> = {
   'terminal.updated': 'Terminal alterado',
   'terminal.deleted': 'Terminal excluído',
 };
+
+const clockFormat = new Intl.DateTimeFormat('pt-BR', { timeStyle: 'medium', timeZone: 'America/Sao_Paulo' });
+/** Horário (HH:MM:SS) em São Paulo. */
+export const clock = (d: Date): string => clockFormat.format(d);
+
+/** Data de hoje e de N dias atrás no formato de <input type="date"> (horário local). */
+export function dateInput(daysAgo = 0): string {
+  const d = new Date(Date.now() - daysAgo * 86_400_000);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}

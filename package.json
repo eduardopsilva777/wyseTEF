@@ -19,7 +19,7 @@
     "apps/web"
   ],
   "scripts": {
-    "typecheck": "tsc -p tsconfig.json && tsc -p apps/web/tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json && tsc -p apps/web/tsconfig.json && tsc -p e2e/tsconfig.json",
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -37,10 +37,12 @@
     "db:seed": "node --env-file-if-exists=.env packages/persistence/src/cli/seed.ts",
     "dev": "node scripts/dev.mjs",
     "dev:setup": "node scripts/dev-setup.mjs",
-    "check:web": "node scripts/check-web-bundle.mjs"
+    "check:web": "node scripts/check-web-bundle.mjs",
+    "test:e2e": "node scripts/test-e2e.mjs"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
+    "@playwright/test": "1.64.1",
     "@types/node": "24.19.2",
     "@types/pg": "8.23.1",
     "eslint": "10.13.0",

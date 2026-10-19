@@ -1,6 +1,6 @@
 # TEF Platform
 
-Plataforma de orquestração de pagamentos (TEF): **Fase 2A, MVP local** com API assíncrona, worker, PostgreSQL e painel web.
+**WyseTEF**: plataforma de orquestração de pagamentos (TEF). **Fase 2A, MVP local** com API assíncrona, worker, PostgreSQL e painel web.
 
 > **Aviso:** não há integração com adquirentes ou provedores reais. O único provedor é o **SIMULATOR**, com dados fictícios. Nenhum pagamento é real.
 > A plataforma não é homologada, certificada nem conforme ao PCI, e não está pronta para produção. O acesso ao painel é exclusivo do ambiente de desenvolvimento local.
@@ -41,6 +41,7 @@ Tudo escuta apenas em loopback; a configuração recusa outros endereços nesta 
 | `npm run lint` / `typecheck` | ESLint (com tipos) e TypeScript strict (backend e painel) |
 | `npm test` | Todos os testes; os de PostgreSQL aparecem como *skipped* sem banco |
 | `npm run test:db` | Testes de integração com PostgreSQL real (exige `db:up`) |
+| `npm run test:e2e` | Testes do painel no navegador (Playwright + Edge do sistema; exige `db:up`). Cria um banco descartável e credenciais aleatórias, usa as portas 3100/3101/5180 e apaga o banco ao final |
 | `npm run check:web` | Gera o bundle do painel e procura segredos nele |
 | `npm run check:secrets` / `check:deps` | Varredura de segredos no repositório / `npm audit` |
 | `npm run verify` | lint + tipos + testes + bundle + segredos + dependências |

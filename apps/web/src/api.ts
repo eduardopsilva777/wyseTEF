@@ -166,6 +166,7 @@ export interface AuditEntry {
   action: string;
   resourceType: string;
   resourceId: string;
+  correlationId: string | null;
   data: Record<string, string | number | boolean | null>;
   hash: string;
 }

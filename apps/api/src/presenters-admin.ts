@@ -73,6 +73,7 @@ export const presentAudit = (r: AuditRecord) => ({
   action: r.action,
   resourceType: r.resourceType,
   resourceId: r.resourceId,
+  correlationId: r.correlationId,
   data: r.data,
   hash: r.hash,
 });

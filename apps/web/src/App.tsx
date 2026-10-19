@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react';
-import { api, ApiError, setUnauthenticatedHandler, type Session } from './api.ts';
-import { Loading, ToastProvider } from './components/ui.tsx';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { api, setUnauthenticatedHandler, type Session } from './api.ts';
+import { Loading, ToastProvider, Wordmark } from './components/ui.tsx';
 import { AuditPage } from './pages/Audit.tsx';
 import { CustomersPage } from './pages/Customers.tsx';
 import { DashboardPage } from './pages/Dashboard.tsx';
@@ -10,11 +10,13 @@ import { PaymentsPage } from './pages/Payments.tsx';
 import { SimulatorPage } from './pages/Simulator.tsx';
 import { TerminalsPage } from './pages/Terminals.tsx';
 import { UsersPage } from './pages/Users.tsx';
+import { useTheme } from './theme.ts';
 
 interface RouteDef {
   path: string;
   label: string;
   group: 'operação' | 'cadastro' | 'controle';
+  tag?: string;
   render: (params: URLSearchParams) => ReactNode;
 }
 
@@ -26,7 +28,7 @@ const ROUTES: RouteDef[] = [
   { path: 'estabelecimentos', label: 'Estabelecimentos', group: 'cadastro', render: (p) => <MerchantsPage params={p} /> },
   { path: 'terminais', label: 'Terminais', group: 'cadastro', render: (p) => <TerminalsPage params={p} /> },
   { path: 'auditoria', label: 'Auditoria', group: 'controle', render: () => <AuditPage /> },
-  { path: 'usuarios', label: 'Usuários e permissões', group: 'controle', render: () => <UsersPage /> },
+  { path: 'usuarios', label: 'Usuários e permissões', group: 'controle', tag: 'futuro', render: () => <UsersPage /> },
 ];
 
 const GROUP_LABEL = { operação: 'Operação', cadastro: 'Cadastro', controle: 'Controle' } as const;
@@ -55,21 +57,43 @@ function useHashRoute() {
 function SafetyBand() {
   return (
     <div className="safety-band" role="note">
-      <strong>Ambiente local de demonstração.</strong> Todas as transações passam pelo simulador com dados fictícios. Nenhum pagamento é real.
+      <strong>Ambiente local de demonstração.</strong>
+      <span>Todas as transações passam pelo simulador com dados fictícios. Nenhum pagamento é real.</span>
     </div>
   );
 }
 
+function ThemeToggle() {
+  const [theme, setTheme] = useTheme();
+  const next = theme === 'dark' ? 'light' : 'dark';
+  return (
+    <button type="button" className="icon-btn" onClick={() => setTheme(next)} aria-label={theme === 'dark' ? 'Usar tema claro' : 'Usar tema escuro'} title={theme === 'dark' ? 'Tema claro' : 'Tema escuro'}>
+      <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true">
+        {theme === 'dark' ? (
+          <g fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+            <circle cx="10" cy="10" r="3.5" />
+            <path d="M10 2.5v2M10 15.5v2M2.5 10h2M15.5 10h2M4.7 4.7l1.4 1.4M13.9 13.9l1.4 1.4M4.7 15.3l1.4-1.4M13.9 6.1l1.4-1.4" />
+          </g>
+        ) : (
+          <path d="M15.5 12.5A6.5 6.5 0 0 1 7.5 4.5a6.5 6.5 0 1 0 8 8z" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+        )}
+      </svg>
+    </button>
+  );
+}
+
 export function App() {
+  useTheme(); // aplica o tema salvo desde o primeiro render
   const route = useHashRoute();
   const [session, setSession] = useState<Session | null | 'checking'>('checking');
   const [navOpen, setNavOpen] = useState(false);
+  const menuButton = useRef<HTMLButtonElement>(null);
 
   const check = useCallback(() => {
     api
       .get<Session>('/session')
       .then(setSession)
-      .catch((e: unknown) => setSession(e instanceof ApiError && e.status === 401 ? null : null));
+      .catch(() => setSession(null));
   }, []);
 
   useEffect(() => {
@@ -78,6 +102,18 @@ export function App() {
   }, [check]);
 
   useEffect(() => setNavOpen(false), [route.path]);
+
+  useEffect(() => {
+    if (!navOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setNavOpen(false);
+        menuButton.current?.focus();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [navOpen]);
 
   if (session === 'checking') {
     return (
@@ -101,21 +137,15 @@ export function App() {
 
   return (
     <ToastProvider>
+      <a className="skip-link" href="#conteudo" onClick={(e) => { e.preventDefault(); document.getElementById('conteudo')?.focus(); }}>
+        Pular para o conteúdo
+      </a>
       <SafetyBand />
       <div className="shell">
-        <aside className={`rail ${navOpen ? 'rail-open' : ''}`}>
+        <aside className={`rail ${navOpen ? 'rail-open' : ''}`} aria-label="Navegação principal">
           <div className="brand">
-            <span className="brand-mark" aria-hidden="true">
-              <svg viewBox="0 0 24 24" width="22" height="22">
-                <rect x="3" y="6" width="18" height="12" rx="2.5" fill="none" stroke="currentColor" strokeWidth="1.8" />
-                <path d="M3 10h18" stroke="currentColor" strokeWidth="1.8" />
-                <path d="M7 14.5h4" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-              </svg>
-            </span>
-            <span>
-              <span className="brand-name">TEF Platform</span>
-              <span className="brand-sub">Console de operação</span>
-            </span>
+            <Wordmark />
+            <span className="brand-sub">Console de operação</span>
           </div>
           <nav aria-label="Seções">
             {groups.map(({ g, items }) => (
@@ -124,6 +154,7 @@ export function App() {
                 {items.map((r) => (
                   <a key={r.path} href={`#/${r.path}`} className={`nav-link ${r.path === current.path ? 'active' : ''}`} aria-current={r.path === current.path ? 'page' : undefined}>
                     {r.label}
+                    {r.tag ? <span className="nav-tag">{r.tag}</span> : null}
                   </a>
                 ))}
               </div>
@@ -136,7 +167,7 @@ export function App() {
             </p>
             <button
               type="button"
-              className="rail-logout"
+              className="btn btn-sm btn-secondary"
               onClick={() => {
                 void api.del('/session').finally(() => setSession(null));
               }}
@@ -145,16 +176,33 @@ export function App() {
             </button>
           </div>
         </aside>
+        {navOpen ? <button type="button" className="backdrop" aria-label="Fechar menu" onClick={() => setNavOpen(false)} /> : null}
         <div className="main">
           <div className="topbar">
-            <button type="button" className="menu-btn" onClick={() => setNavOpen((o) => !o)} aria-expanded={navOpen} aria-label="Abrir menu">
+            <button
+              ref={menuButton}
+              type="button"
+              className="icon-btn menu-btn"
+              onClick={() => setNavOpen((o) => !o)}
+              aria-expanded={navOpen}
+              aria-label={navOpen ? 'Fechar menu' : 'Abrir menu'}
+            >
               <svg viewBox="0 0 20 20" width="20" height="20" aria-hidden="true">
                 <path d="M3 6h14M3 10h14M3 14h14" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
               </svg>
             </button>
-            <span className="topbar-title">{current.label}</span>
+            <span className="topbar-context">
+              <span className="hide-sm">{GROUP_LABEL[current.group]}</span>
+              <span className="path-sep hide-sm" aria-hidden="true">
+                ›
+              </span>
+              <strong>{current.label}</strong>
+            </span>
+            <div className="topbar-actions">
+              <ThemeToggle />
+            </div>
           </div>
-          <main className="content" key={current.path}>
+          <main className="content" id="conteudo" tabIndex={-1} key={current.path}>
             {current.render(route.params)}
           </main>
         </div>

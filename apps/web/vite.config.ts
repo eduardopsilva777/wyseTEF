@@ -1,6 +1,10 @@
 import react from '@vitejs/plugin-react';
 import { defineConfig } from 'vite';
 
+// Lido somente no Node (configuração); nunca chega ao bundle do navegador.
+declare const process: { env: Record<string, string | undefined> };
+const apiPort = Number(process.env['TEF_WEB_API_PORT'] ?? '3000');
+
 /**
  * Painel administrativo LOCAL.
  * - Escuta somente em loopback (127.0.0.1), porta fixa.
@@ -17,7 +21,7 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
     proxy: {
-      '/admin': { target: 'http://127.0.0.1:3000', changeOrigin: false },
+      '/admin': { target: `http://127.0.0.1:${apiPort}`, changeOrigin: false },
     },
   },
   preview: { host: '127.0.0.1', port: 4173, strictPort: true },
