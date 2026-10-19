@@ -17,5 +17,5 @@
 `PROCESSING` passa a significar "autorização aceita para processamento". O status da operação diz se ela ainda não foi enviada (`PENDING`) ou se pode ter sido enviada (`IN_FLIGHT`). A regra que importa não muda: só há `UNKNOWN` depois de um possível envio, e `UNKNOWN` nunca é reenviado.
 
 ## Consequências
-- O relógio usado para `available_at` e leases é o da aplicação; componentes em máquinas diferentes exigiriam relógios sincronizados (pendência: usar o relógio do banco).
+- ~~O relógio usado para `available_at` e leases é o da aplicação~~ — resolvido pela **ADR 0019**: a fila usa o relógio do PostgreSQL (`clock_timestamp()`), e os chamadores informam durações.
 - Tarefas que esgotam tentativas ficam `FAILED` e aparecem no painel; não há rotina automática de saneamento.

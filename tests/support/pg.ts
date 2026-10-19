@@ -36,3 +36,17 @@ export async function createTestSchema(): Promise<TestSchema> {
     },
   };
 }
+
+/**
+ * Isola a fila entre testes que compartilham o schema: tarefas ainda ativas de testes
+ * anteriores são encerradas (DONE), para que o worker de um teste não as reivindique.
+ * Necessário porque o relógio da fila é o do banco (ADR 0019): tarefas agendadas por um
+ * teste vencem, em tempo real, durante os seguintes. Não apaga histórico.
+ */
+export async function quiesceQueue(pool: pg.Pool): Promise<void> {
+  await pool.query(
+    `UPDATE jobs SET status = 'DONE', lease_owner = NULL, lease_expires_at = NULL,
+            completed_at = clock_timestamp(), updated_at = clock_timestamp(), last_error_code = 'TEST_QUIESCED'
+      WHERE status IN ('PENDING', 'RUNNING')`,
+  );
+}

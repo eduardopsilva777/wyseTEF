@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { AdminService, HasDependenciesError, DuplicateCodeError, OutboxPublisher, PaymentService } from '@tef/application';
 import { parseMerchantId, parseTenantId, parseTerminalId } from '@tef/domain';
 import { createProviderRegistry } from '@tef/provider-contract';
@@ -9,10 +9,10 @@ import { DevAdminAuth } from '../../apps/api/src/admin-auth.ts';
 import { buildApp } from '../../apps/api/src/app.ts';
 import { createAuthenticator } from '../../apps/api/src/auth.ts';
 import { createLogger } from '../../apps/api/src/logging.ts';
-import { RecordingSink, testRuntime } from '../support/async.ts';
+import { RecordingSink, TEST_RECONCILE_DELAY_MS, testRuntime } from '../support/async.ts';
 import { describeAsyncSuite } from '../support/async-suite.ts';
-import { createCommand, ctxA, newKey } from '../support/harness.ts';
-import { createTestSchema, TEST_DATABASE_URL, type TestSchema } from '../support/pg.ts';
+import { createCommand, ctxA, newKey, sleep } from '../support/harness.ts';
+import { createTestSchema, quiesceQueue, TEST_DATABASE_URL, type TestSchema } from '../support/pg.ts';
 
 /**
  * Modelo assíncrono contra PostgreSQL REAL: fila com SKIP LOCKED e lease, outbox,
@@ -30,7 +30,15 @@ describe.skipIf(!TEST_DATABASE_URL)('PostgreSQL — modelo assíncrono', () => {
 
   describeAsyncSuite({
     name: 'postgres',
-    uow: () => Promise.resolve(db.uow),
+    // O relógio da fila é o do banco; o relógio do teste só governa os fatos de negócio.
+    uow: async () => {
+      await quiesceQueue(db.pool);
+      return db.uow;
+    },
+    advanceQueue: async (clock, ms) => {
+      clock.ms += ms;
+      await sleep(ms);
+    },
     resultCount: async (tenantId, operationId) =>
       (
         await db.pool.query<{ n: number }>(
@@ -48,6 +56,10 @@ describe.skipIf(!TEST_DATABASE_URL)('PostgreSQL — modelo assíncrono', () => {
   });
 
   describe('concorrência real', () => {
+    beforeEach(async () => {
+      await quiesceQueue(db.pool);
+    });
+
     it('três workers simultâneos: cada tarefa é executada uma única vez', async () => {
       const clock = { ms: Date.parse('2026-10-18T12:00:00.000Z') };
       const workers = ['w1', 'w2', 'w3'].map((id) => testRuntime(db.uow, { workerId: `${id}-${Date.now()}`, clock }));
@@ -94,7 +106,9 @@ describe.skipIf(!TEST_DATABASE_URL)('PostgreSQL — modelo assíncrono', () => {
 
       // Novo processo (outra instância, memória vazia), mesmo banco.
       const after = testRuntime(db.uow, { workerId: 'w-depois', clock, ledger: createPgSimulatorLedger(db.pool) });
-      clock.ms += 10_000;
+      // A consulta agendada vence pelo relógio do banco (ADR 0019): espera real, não só o relógio do teste.
+      clock.ms += 3 * TEST_RECONCILE_DELAY_MS;
+      await sleep(3 * TEST_RECONCILE_DELAY_MS);
       await after.worker.runOnce();
       const view = await after.service.getPayment(ctxA, created.payment.id);
       expect(view.payment.state).toBe('DECLINED'); // não CANCELLED: o simulador sabe que processou
@@ -130,8 +144,7 @@ describe.skipIf(!TEST_DATABASE_URL)('PostgreSQL — modelo assíncrono', () => {
       const op = created.operations[0]!;
       const again = await db.uow.transaction((r) =>
         r.jobs.enqueue(
-          { kind: 'EXECUTE_OPERATION', tenantId: ctxA.tenantId, paymentId: created.payment.id, operationId: op.id, availableAt: new Date(), maxAttempts: 5 },
-          new Date(),
+          { kind: 'EXECUTE_OPERATION', tenantId: ctxA.tenantId, paymentId: created.payment.id, operationId: op.id, delayMs: 0, maxAttempts: 5 },
         ),
       );
       expect(again).toBe(false);

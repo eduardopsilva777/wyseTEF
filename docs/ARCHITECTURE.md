@@ -47,7 +47,7 @@
 ## Fluxo assíncrono de um pagamento (implementado)
 
 1. **API — transação única:** reserva a chave de idempotência; valida cliente, estabelecimento e terminal (ativos, coerentes); grava o pagamento; com `authorize`, aplica `CREATED → PROCESSING`, grava a operação `PENDING`, a tarefa `EXECUTE_OPERATION`, a auditoria e a outbox. Responde **202**.
-2. **Worker — reivindica** a tarefa (`SKIP LOCKED`, lease).
+2. **Worker — reivindica** a tarefa (`SKIP LOCKED`, lease). Prazos pelo relógio do PostgreSQL, não do processo (ADR 0019).
 3. **Worker — transação:** bloqueia o pagamento; se a operação está `PENDING`, marca `IN_FLIGHT` (o "envio" só acontece uma vez); se já está `IN_FLIGHT`, o worker anterior caiu: marca `UNKNOWN` sem reenviar.
 4. **Worker — chama o provedor** fora de transação, com timeout. Exceção ou timeout viram `UNKNOWN`.
 5. **Worker — transação:** registra o resultado (idempotente). Se `UNKNOWN` e o provedor tem consulta, enfileira `RECONCILE_OPERATION`.

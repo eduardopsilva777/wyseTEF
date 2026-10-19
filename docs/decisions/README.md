@@ -25,3 +25,4 @@ Status possíveis: **Aceita**, **Provisória** (vale até a condição de revis�
 | [0016](0016-livro-duravel-do-simulador.md) | Livro durável do simulador; a API nunca chama o provedor | Aceita |
 | [0017](0017-painel-web-local.md) | Painel web local (React + Vite) sem segredos no navegador | Aceita |
 | [0018](0018-pacote-observability.md) | Logger sanitizado compartilhado (@tef/observability) | Aceita |
+| [0019](0019-relogio-do-banco-na-fila.md) | Relógio do PostgreSQL como autoridade temporal da fila (altera a consequência de relógio da 0013) | Aceita |

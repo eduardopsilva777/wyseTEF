@@ -75,9 +75,22 @@ function emptyState(): State {
   };
 }
 
+export interface InMemoryOptions {
+  /**
+   * Relógio da fila (equivale ao `clock_timestamp()` do PostgreSQL, ADR 0019). Injetável
+   * para testes determinísticos; padrão: relógio do processo.
+   */
+  readonly clock?: () => Date;
+}
+
 export class InMemoryUnitOfWork implements UnitOfWork {
   private state: State = emptyState();
   private queue: Promise<void> = Promise.resolve();
+  private readonly clock: () => Date;
+
+  constructor(options: InMemoryOptions = {}) {
+    this.clock = options.clock ?? (() => new Date());
+  }
 
   async transaction<T>(work: (repos: Repositories) => Promise<T>): Promise<T> {
     let release!: () => void;
@@ -86,7 +99,7 @@ export class InMemoryUnitOfWork implements UnitOfWork {
     await previous;
     try {
       const draft = structuredClone(this.state);
-      const result = await work(createRepositories(draft));
+      const result = await work(createRepositories(draft, this.clock));
       this.state = draft; // "commit"
       return result;
     } finally {
@@ -112,7 +125,16 @@ function inPeriod(date: Date, from?: Date, to?: Date): boolean {
   return (!from || date.getTime() >= from.getTime()) && (!to || date.getTime() <= to.getTime());
 }
 
-function createRepositories(s: State): Repositories {
+function createRepositories(s: State, clock: () => Date): Repositories {
+  /** Tarefa ativa: PENDING, ou RUNNING com lease ainda válido pelo relógio da fila. */
+  const activeJobFor = (operationId: string, t: number): boolean =>
+    s.jobs.some(
+      (j) => j.operationId === operationId && (j.status === 'PENDING' || (j.status === 'RUNNING' && (j.leaseExpiresAt?.getTime() ?? 0) > t)),
+    );
+  /** Mesma regra de posse do PostgreSQL: RUNNING, do worker e com lease não expirado. */
+  const ownedIndex = (jobId: number, workerId: string, t: number): number =>
+    s.jobs.findIndex((j) => j.id === jobId && j.status === 'RUNNING' && j.leaseOwner === workerId && (j.leaseExpiresAt?.getTime() ?? 0) > t);
+
   const paymentsOf = (pred: (p: Payment) => boolean): Payment[] => [...s.payments.values()].filter(pred);
   return {
     payments: {
@@ -175,7 +197,7 @@ function createRepositories(s: State): Repositories {
       },
       async listInFlightUpdatedBefore(cutoff, limit) {
         return [...s.operations.values()]
-          .filter((o) => o.status === 'IN_FLIGHT' && o.updatedAt.getTime() < cutoff.getTime())
+          .filter((o) => o.status === 'IN_FLIGHT' && o.updatedAt.getTime() < cutoff.getTime() && !activeJobFor(o.id, clock().getTime()))
           .slice(0, limit);
       },
     },
@@ -227,16 +249,19 @@ function createRepositories(s: State): Repositories {
       },
     },
     jobs: {
-      async enqueue(job, now) {
+      async enqueue(job) {
         const active = s.jobs.some(
           (j) => j.operationId === job.operationId && j.kind === job.kind && (j.status === 'PENDING' || j.status === 'RUNNING'),
         );
         if (active) return false;
+        const now = clock();
+        const { delayMs, ...rest } = job;
         s.jobs.push({
-          ...job,
+          ...rest,
           id: ++s.sequence,
           status: 'PENDING',
           attempts: 0,
+          availableAt: new Date(now.getTime() + Math.max(0, delayMs)),
           leaseOwner: null,
           leaseExpiresAt: null,
           lastErrorCode: null,
@@ -246,7 +271,8 @@ function createRepositories(s: State): Repositories {
         });
         return true;
       },
-      async claim(workerId, limit, leaseMs, now) {
+      async claim(workerId, limit, leaseMs) {
+        const now = clock();
         const t = now.getTime();
         const claimable = s.jobs
           .filter(
@@ -271,29 +297,30 @@ function createRepositories(s: State): Repositories {
         }
         return claimed;
       },
-      async renewLease(jobId, workerId, leaseMs, now) {
-        const i = s.jobs.findIndex(
-          (j) => j.id === jobId && j.status === 'RUNNING' && j.leaseOwner === workerId && (j.leaseExpiresAt?.getTime() ?? 0) > now.getTime(),
-        );
+      async renewLease(jobId, workerId, leaseMs) {
+        const now = clock();
+        const i = ownedIndex(jobId, workerId, now.getTime());
         if (i < 0) return false;
         s.jobs[i] = { ...s.jobs[i]!, leaseExpiresAt: new Date(now.getTime() + leaseMs), updatedAt: now };
         return true;
       },
-      async complete(jobId, workerId, now) {
-        const i = s.jobs.findIndex((j) => j.id === jobId && j.status === 'RUNNING' && j.leaseOwner === workerId);
+      async complete(jobId, workerId) {
+        const now = clock();
+        const i = ownedIndex(jobId, workerId, now.getTime());
         if (i < 0) return false;
         s.jobs[i] = { ...s.jobs[i]!, status: 'DONE', leaseOwner: null, leaseExpiresAt: null, completedAt: now, updatedAt: now };
         return true;
       },
-      async retryLater(jobId, workerId, availableAt, errorCode, now) {
-        const i = s.jobs.findIndex((j) => j.id === jobId && j.status === 'RUNNING' && j.leaseOwner === workerId);
+      async retryLater(jobId, workerId, delayMs, errorCode) {
+        const now = clock();
+        const i = ownedIndex(jobId, workerId, now.getTime());
         if (i < 0) return 'LOST_LEASE';
         const job = s.jobs[i]!;
         const failed = job.attempts >= job.maxAttempts;
         s.jobs[i] = {
           ...job,
           status: failed ? 'FAILED' : 'PENDING',
-          availableAt,
+          availableAt: new Date(now.getTime() + Math.max(0, delayMs)),
           leaseOwner: null,
           leaseExpiresAt: null,
           lastErrorCode: errorCode,
@@ -302,7 +329,8 @@ function createRepositories(s: State): Repositories {
         };
         return failed ? 'FAILED' : 'RESCHEDULED';
       },
-      async makeAvailableNow(operationId, kind, now) {
+      async makeAvailableNow(operationId, kind) {
+        const now = clock();
         let changed = false;
         s.jobs = s.jobs.map((j) => {
           if (j.operationId !== operationId || j.kind !== kind || j.status !== 'PENDING') return j;

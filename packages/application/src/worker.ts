@@ -137,7 +137,8 @@ export class Worker {
       repos.heartbeats.beat({ workerId: this.workerId, startedAt: this.startedAt ?? now, lastBeatAt: now, status: 'RUNNING' }),
     );
 
-    const jobs = await this.uow.transaction((repos) => repos.jobs.claim(this.workerId, this.batchSize, this.leaseMs, now));
+    // Reivindicação e lease decididos pelo relógio da fila (ADR 0019), não por `now`.
+    const jobs = await this.uow.transaction((repos) => repos.jobs.claim(this.workerId, this.batchSize, this.leaseMs));
     await Promise.all(jobs.map((job) => this.runJob(job)));
     this.jobsProcessed += jobs.length;
 
@@ -154,21 +155,20 @@ export class Worker {
   }
 
   private async runJob(job: Job): Promise<void> {
-    const now = this.clock();
     try {
       if (job.attempts > job.maxAttempts) {
-        await this.uow.transaction((repos) => repos.jobs.retryLater(job.id, this.workerId, now, 'MAX_ATTEMPTS_EXCEEDED', now));
+        await this.uow.transaction((repos) => repos.jobs.retryLater(job.id, this.workerId, 0, 'MAX_ATTEMPTS_EXCEEDED'));
         this.logger.error({ jobId: job.id, operationId: job.operationId, kind: job.kind }, 'tarefa excedeu o máximo de tentativas; marcada FAILED');
         return;
       }
       const outcome = await this.service.processJob(job, this.actor, { workerId: this.workerId, leaseMs: this.leaseMs });
       if (outcome.kind === 'LOST_LEASE') return; // outro worker é o dono atual
       if (outcome.kind === 'DONE') {
-        const completed = await this.uow.transaction((repos) => repos.jobs.complete(job.id, this.workerId, this.clock()));
+        const completed = await this.uow.transaction((repos) => repos.jobs.complete(job.id, this.workerId));
         if (!completed) this.logger.warn({ jobId: job.id }, 'lease perdido antes da conclusão; outro worker assumiu a tarefa');
       } else {
         const result = await this.uow.transaction((repos) =>
-          repos.jobs.retryLater(job.id, this.workerId, outcome.availableAt, outcome.errorCode, this.clock()),
+          repos.jobs.retryLater(job.id, this.workerId, outcome.delayMs, outcome.errorCode),
         );
         if (result === 'FAILED') this.logger.error({ jobId: job.id, kind: job.kind }, 'tarefa sem resolução após o máximo de tentativas');
       }
@@ -180,7 +180,7 @@ export class Worker {
       );
       await this.uow
         .transaction((repos) =>
-          repos.jobs.retryLater(job.id, this.workerId, new Date(this.clock().getTime() + 1_000 * job.attempts), 'PROCESSING_ERROR', this.clock()),
+          repos.jobs.retryLater(job.id, this.workerId, 1_000 * job.attempts, 'PROCESSING_ERROR'),
         )
         .catch(() => undefined); // se nem isso for possível, o lease expira e a tarefa é retomada
     }

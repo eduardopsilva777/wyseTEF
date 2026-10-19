@@ -287,8 +287,15 @@ export function createPgRepositories(db: Queryable): Repositories {
       },
       async listInFlightUpdatedBefore(cutoff, limit) {
         const res = await db.query<OperationRow>(
-          `SELECT ${OPERATION_COLUMNS} FROM payment_operations
-            WHERE status = 'IN_FLIGHT' AND updated_at < $1 ORDER BY updated_at LIMIT $2`,
+          // A posse de uma tarefa ativa (lease válido pelo relógio do banco, ADR 0019) prevalece
+          // sobre a idade calculada por quem varre: operação com dono vivo não é abandonada.
+          `SELECT ${OPERATION_COLUMNS} FROM payment_operations o
+            WHERE o.status = 'IN_FLIGHT' AND o.updated_at < $1
+              AND NOT EXISTS (
+                SELECT 1 FROM jobs j
+                 WHERE j.operation_id = o.id
+                   AND (j.status = 'PENDING' OR (j.status = 'RUNNING' AND j.lease_expires_at > clock_timestamp())))
+            ORDER BY o.updated_at LIMIT $2`,
           [cutoff, limit],
         );
         return res.rows.map(toOperation);

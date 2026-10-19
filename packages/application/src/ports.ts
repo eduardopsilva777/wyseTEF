@@ -39,6 +39,12 @@ export interface OperationRepository {
   findByIdForSystem(id: OperationId): Promise<Operation | null>;
   listByPayment(tenantId: TenantId, paymentId: PaymentId): Promise<Operation[]>;
   update(operation: Operation, expectedVersion: number): Promise<void>;
+  /**
+   * Operações IN_FLIGHT com `updated_at` (instante do envio, fato de negócio) anterior a
+   * `cutoff` e SEM tarefa ativa: nenhuma tarefa PENDING nem RUNNING com lease ainda válido
+   * pelo relógio da fila (no PostgreSQL, `clock_timestamp()`). Enquanto um worker detém o
+   * lease, a operação não é considerada abandonada, qualquer que seja o relógio de quem varre.
+   */
   listInFlightUpdatedBefore(cutoff: Date, limit: number): Promise<Operation[]>;
 }
 
@@ -99,6 +105,11 @@ export interface OutboxRepository {
 // ---------------------------------------------------------------------------
 // Fila durável de tarefas
 // ---------------------------------------------------------------------------
+//
+// Relógio da fila (ADR 0019): disponibilidade, reivindicação, lease, conclusão e
+// reagendamento são decididos pelo relógio do REPOSITÓRIO — no PostgreSQL,
+// `clock_timestamp()`; em memória, o relógio injetado. Os chamadores informam
+// DURAÇÕES (atraso, lease), nunca instantes absolutos calculados no processo.
 
 export type JobKind = 'EXECUTE_OPERATION' | 'RECONCILE_OPERATION';
 export type JobStatus = 'PENDING' | 'RUNNING' | 'DONE' | 'FAILED';
@@ -126,7 +137,8 @@ export interface NewJob {
   readonly tenantId: TenantId;
   readonly paymentId: PaymentId;
   readonly operationId: OperationId;
-  readonly availableAt: Date;
+  /** Atraso até a tarefa ficar disponível, contado pelo relógio da fila (0 = já). */
+  readonly delayMs: number;
   readonly maxAttempts: number;
 }
 
@@ -134,24 +146,28 @@ export type RetryResult = 'RESCHEDULED' | 'FAILED' | 'LOST_LEASE';
 
 export interface JobRepository {
   /** Não duplica: se já houver tarefa ativa do mesmo tipo para a operação, retorna `false`. */
-  enqueue(job: NewJob, now: Date): Promise<boolean>;
+  enqueue(job: NewJob): Promise<boolean>;
   /**
    * Reivindica tarefas PENDING vencidas ou RUNNING com lease expirado (worker que caiu),
-   * com FOR UPDATE SKIP LOCKED, e concede um novo lease ao `workerId`.
+   * com FOR UPDATE SKIP LOCKED, e concede um lease de `leaseMs` a partir do relógio da fila.
    */
-  claim(workerId: string, limit: number, leaseMs: number, now: Date): Promise<Job[]>;
+  claim(workerId: string, limit: number, leaseMs: number): Promise<Job[]>;
   /**
-   * Fencing + renovação: estende o lease a partir de `now` SOMENTE se a tarefa ainda está
-   * RUNNING, pertence ao worker e o lease não expirou. Executada na mesma transação que
-   * age sobre a operação, garante que um worker que perdeu a posse não envie nada.
+   * Fencing + renovação: estende o lease por `leaseMs` a partir do relógio da fila SOMENTE se
+   * a tarefa ainda está RUNNING, pertence ao worker e o lease não expirou (não ressuscita lease
+   * vencido). Executada na mesma transação que age sobre a operação, garante que um worker
+   * que perdeu a posse não envie nada.
    */
-  renewLease(jobId: number, workerId: string, leaseMs: number, now: Date): Promise<boolean>;
-  /** Conclui a tarefa; `false` se o lease já não pertence ao worker (fencing). */
-  complete(jobId: number, workerId: string, now: Date): Promise<boolean>;
-  /** Reagenda, ou marca FAILED ao atingir o máximo de tentativas. */
-  retryLater(jobId: number, workerId: string, availableAt: Date, errorCode: string, now: Date): Promise<RetryResult>;
+  renewLease(jobId: number, workerId: string, leaseMs: number): Promise<boolean>;
+  /** Conclui a tarefa; `false` se o worker já não detém um lease válido (fencing). */
+  complete(jobId: number, workerId: string): Promise<boolean>;
+  /**
+   * Reagenda para daqui a `delayMs` (relógio da fila), ou marca FAILED ao atingir o máximo de
+   * tentativas; `LOST_LEASE` se o worker já não detém um lease válido.
+   */
+  retryLater(jobId: number, workerId: string, delayMs: number, errorCode: string): Promise<RetryResult>;
   /** Antecipa uma tarefa PENDING (ex.: "reconciliar agora" no painel). `false` se não houver. */
-  makeAvailableNow(operationId: OperationId, kind: JobKind, now: Date): Promise<boolean>;
+  makeAvailableNow(operationId: OperationId, kind: JobKind): Promise<boolean>;
   countByStatus(): Promise<Record<JobStatus, number>>;
   listByPayment(tenantId: TenantId, paymentId: PaymentId): Promise<Job[]>;
 }

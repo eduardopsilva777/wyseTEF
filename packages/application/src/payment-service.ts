@@ -107,7 +107,8 @@ export type JobOutcome =
   | { readonly kind: 'DONE'; readonly detail: string }
   /** O worker perdeu a posse da tarefa: nada foi feito; o dono atual a processa. */
   | { readonly kind: 'LOST_LEASE' }
-  | { readonly kind: 'RETRY'; readonly availableAt: Date; readonly errorCode: string };
+  /** Reagendar: `delayMs` é contado pelo relógio da fila (ADR 0019), não pelo do processo. */
+  | { readonly kind: 'RETRY'; readonly delayMs: number; readonly errorCode: string };
 
 const SYSTEM_RECONCILER: Actor = { type: 'SYSTEM', id: 'reconciler' };
 const SYSTEM_RECOVERY: Actor = { type: 'SYSTEM', id: 'recovery' };
@@ -286,10 +287,9 @@ export class PaymentService {
         tenantId: payment.tenantId,
         paymentId: payment.id,
         operationId: operation.id,
-        availableAt: now,
+        delayMs: 0,
         maxAttempts: this.jobMaxAttempts,
       },
-      now,
     );
     await this.audit(repos, ctx, 'operation.requested', 'operation', operation.id, now, {
       operationKind: operation.kind,
@@ -417,7 +417,7 @@ export class PaymentService {
       if (!provider.capabilities.query) {
         throw new ReconciliationRequiresManualActionError('o provedor não oferece consulta; use conciliação por arquivo ou resolução manual');
       }
-      const expedited = await repos.jobs.makeAvailableNow(unknown.id, 'RECONCILE_OPERATION', now);
+      const expedited = await repos.jobs.makeAvailableNow(unknown.id, 'RECONCILE_OPERATION');
       if (!expedited) {
         await repos.jobs.enqueue(
           {
@@ -425,10 +425,9 @@ export class PaymentService {
             tenantId: payment.tenantId,
             paymentId: payment.id,
             operationId: unknown.id,
-            availableAt: now,
+            delayMs: 0,
             maxAttempts: this.reconcileMaxAttempts,
           },
-          now,
         );
       }
       await this.audit(repos, ctx, 'operation.reconciliation_requested', 'operation', unknown.id, now, {
@@ -454,7 +453,7 @@ export class PaymentService {
       // Ordem fixa de bloqueio: pagamento, depois a tarefa. Fencing: sem posse válida do
       // lease, não toca na operação (nem envia, nem marca UNKNOWN).
       const payment = await repos.payments.lockById(job.tenantId, job.paymentId);
-      if (!(await repos.jobs.renewLease(job.id, lease.workerId, lease.leaseMs, now))) return { kind: 'LOST_LEASE' as const };
+      if (!(await repos.jobs.renewLease(job.id, lease.workerId, lease.leaseMs))) return { kind: 'LOST_LEASE' as const };
       const operation = payment ? await repos.operations.findById(job.tenantId, job.operationId) : null;
       if (!payment || !operation) return { kind: 'MISSING' as const };
       if (operation.status === 'IN_FLIGHT') return { kind: 'INTERRUPTED' as const };
@@ -499,7 +498,7 @@ export class PaymentService {
 
   private async processReconcileJob(job: Job, attempt: number, lease: { readonly workerId: string; readonly leaseMs: number }): Promise<JobOutcome> {
     const located = await this.uow.transaction(async (repos) => {
-      if (!(await repos.jobs.renewLease(job.id, lease.workerId, lease.leaseMs, this.clock()))) return 'LOST_LEASE' as const;
+      if (!(await repos.jobs.renewLease(job.id, lease.workerId, lease.leaseMs))) return 'LOST_LEASE' as const;
       return repos.operations.findById(job.tenantId, job.operationId);
     });
     if (located === 'LOST_LEASE') return { kind: 'LOST_LEASE' };
@@ -514,7 +513,7 @@ export class PaymentService {
     }
     // Recuo exponencial limitado (consulta não é reenvio de cobrança).
     const delay = Math.min(this.reconcileDelayMs * 2 ** Math.max(0, attempt - 1), 5 * 60_000);
-    return { kind: 'RETRY', availableAt: new Date(this.clock().getTime() + delay), errorCode: 'RECONCILIATION_UNRESOLVED' };
+    return { kind: 'RETRY', delayMs: delay, errorCode: 'RECONCILIATION_UNRESOLVED' };
   }
 
   private async executeOperation(
@@ -726,10 +725,9 @@ export class PaymentService {
           tenantId: payment.tenantId,
           paymentId: payment.id,
           operationId: operation.id,
-          availableAt: new Date(now.getTime() + this.reconcileDelayMs),
+          delayMs: this.reconcileDelayMs,
           maxAttempts: this.reconcileMaxAttempts,
         },
-        now,
       );
     }
     await this.audit(repos, ctx, 'operation.result_recorded', 'operation', operation.id, now, {

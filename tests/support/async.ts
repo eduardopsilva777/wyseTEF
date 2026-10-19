@@ -17,6 +17,12 @@ export class RecordingSink implements OutboxSink {
   }
 }
 
+/** Relógio de teste controlável (ms). */
+export const newClock = (): { ms: number } => ({ ms: Date.parse('2026-10-18T12:00:00.000Z') });
+
+/** Atraso da primeira reconciliação nos testes: curto, para o PostgreSQL (relógio real) não esperar 2 s. */
+export const TEST_RECONCILE_DELAY_MS = 100;
+
 export interface TestRuntime extends WorkerRuntime {
   readonly sink: RecordingSink;
   /** Relógio controlável compartilhado (ms). */
@@ -26,9 +32,16 @@ export interface TestRuntime extends WorkerRuntime {
 /** Runtime real do worker (apps/worker) com relógio controlável e sink de teste. */
 export function testRuntime(
   uow: UnitOfWork,
-  options: { workerId?: string; providerTimeoutMs?: number; simulatorDelayMs?: number; clock?: { ms: number }; ledger?: SimulatorLedger } = {},
+  options: {
+    workerId?: string;
+    providerTimeoutMs?: number;
+    simulatorDelayMs?: number;
+    reconcileDelayMs?: number;
+    clock?: { ms: number };
+    ledger?: SimulatorLedger;
+  } = {},
 ): TestRuntime {
-  const clock = options.clock ?? { ms: Date.parse('2026-10-18T12:00:00.000Z') };
+  const clock = options.clock ?? newClock();
   const sink = new RecordingSink();
   const providerTimeoutMs = options.providerTimeoutMs ?? 40;
   const runtime = createWorkerRuntime({
@@ -38,6 +51,7 @@ export function testRuntime(
     providerTimeoutMs,
     leaseMs: providerTimeoutMs * 2 + 1_000,
     simulatorDelayMs: options.simulatorDelayMs ?? 120,
+    reconcileDelayMs: options.reconcileDelayMs ?? TEST_RECONCILE_DELAY_MS,
     clock: () => new Date(clock.ms),
     sink,
     ...(options.ledger ? { simulatorLedger: options.ledger } : {}),

@@ -80,6 +80,7 @@ Confirmação ou desfazimento recusados levam a UNKNOWN porque a recusa **não p
 - Tarefa reivindicada de novo com a operação já `IN_FLIGHT` (worker anterior caiu): `UNKNOWN` (`WORKER_INTERRUPTED_AFTER_DISPATCH`), sem reenvio.
 - `UNKNOWN` com provedor que oferece consulta: tarefa `RECONCILE_OPERATION` com recuo exponencial; ao esgotar as tentativas, fica `FAILED` para ação manual.
 - "Reconciliar agora" no painel apenas antecipa essa tarefa; a API não consulta o provedor.
+- Prazos da fila (disponibilidade, lease, reagendamento) seguem o relógio do PostgreSQL (ADR 0019). Lease vencido não é renovado nem concluído: outro worker reassume e, se a operação estiver `IN_FLIGHT`, marca `UNKNOWN` sem reenviar.
 
 ## Concorrência, timeouts e repetição
 

@@ -23,6 +23,8 @@ export interface WorkerRuntimeOptions {
   readonly pollIntervalMs?: number;
   readonly batchSize?: number;
   readonly simulatorDelayMs: number;
+  /** Atraso da primeira consulta de reconciliação (padrão do serviço: 2 s). */
+  readonly reconcileDelayMs?: number;
   readonly clock?: () => Date;
   readonly sink?: OutboxSink;
   /** Livro do simulador; em processos reais, o do PostgreSQL (compartilhado e durável). */
@@ -66,6 +68,7 @@ export function createWorkerRuntime(options: WorkerRuntimeOptions): WorkerRuntim
     providers,
     providerTimeoutMs: options.providerTimeoutMs,
     logger,
+    ...(options.reconcileDelayMs !== undefined ? { reconcileDelayMs: options.reconcileDelayMs } : {}),
     ...(options.clock ? { clock: options.clock } : {}),
   });
   simulator.onNotification((notification) => {

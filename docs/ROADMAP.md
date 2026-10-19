@@ -25,10 +25,13 @@
 10. CI definido em `.github/workflows/ci.yml`, mas **nunca executado** (não há repositório remoto). Actions referenciadas por tag, não por SHA; sem gitleaks nem SAST dedicado.
 11. Isolamento por estabelecimento é aplicado na camada HTTP; aplicação e banco isolam por tenant.
 12. Acesso administrativo apenas de desenvolvimento local (ADR 0015): sem usuários, MFA ou RBAC.
-13. Lease e `available_at` usam o relógio da aplicação; vários hosts exigiriam relógios sincronizados.
+13. ~~Lease e `available_at` usam o relógio da aplicação~~ — resolvido na F2B/I1 (ADR 0019): decisões da fila pelo relógio do PostgreSQL. Resta depender do NTP do servidor de banco; batimento do worker e agendamento da outbox continuam no relógio do processo (sem efeito sobre segurança).
 14. Tarefas `FAILED` (tentativas esgotadas) não têm rotina de saneamento; aparecem no painel.
 15. Painel sem testes automatizados de componentes nem testes Playwright versionados; validado no navegador com playwright-cli (manual) e por testes da API administrativa e verificações estáticas. Recomendado para a F2: Playwright com 5 fluxos (login, CRUD de cliente, pagamento simulado com aprovação, UNKNOWN reconciliado, falha da API exibida) e testes de componentes para formulários e selo de estado.
-16. `recoverStaleInFlight` deve ser chamado com limite maior que o timeout do provedor; uma recuperação prematura marca UNKNOWN cedo demais (sem reenvio; a resposta real ainda resolve a operação — coberto por teste no PostgreSQL), mas não há proteção automática contra configuração errada.
+16. `recoverStaleInFlight` deve ser chamado com limite maior que o timeout do provedor; uma recuperação prematura marca UNKNOWN cedo demais (sem reenvio; a resposta real ainda resolve a operação — coberto por teste no PostgreSQL), mas não há proteção automática contra configuração errada. Desde a ADR 0019, a varredura ignora operações cuja tarefa ainda detém lease válido pelo relógio do banco.
+
+## F2B / I1 — relógio do PostgreSQL na fila (2026-10-19)
+Fila e leases decididos por `clock_timestamp()`; contrato da fila com durações em vez de instantes; conclusão e reagendamento exigem lease válido; varredura de `IN_FLIGHT` respeita a posse de tarefa ativa. Testes no PostgreSQL com relógios de processo divergentes (±1 h) em `tests/integration/postgres-queue-clock.test.ts`. Sem migração.
 
 ## Auditoria pré-commit da F2A (2026-10-18)
 Correções: fencing com renovação de lease antes de qualquer ação do worker; escopo de autoridade do livro do simulador (migração 0004) protegendo o pagamento UNKNOWN legado; erros de carregamento sempre exibidos e atualização periódica que se recupera de falhas; testes de atualização de banco (0001 → 0004), configuração do worker e concorrência entre reconciliação e resposta original.

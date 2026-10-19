@@ -53,7 +53,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
     capabilities: options.capabilities ?? DEFAULT_SIMULATOR_CAPABILITIES,
     scenario: () => state.scenario,
   });
-  const uow = options.uow ?? new InMemoryUnitOfWork();
+  const uow = options.uow ?? new InMemoryUnitOfWork({ clock: () => new Date(state.clockMs) });
   const service = new PaymentService({
     uow,
     providers: createProviderRegistry([simulator, ...(options.extraProviders ?? [])]),

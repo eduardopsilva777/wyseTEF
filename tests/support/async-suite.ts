@@ -2,24 +2,41 @@ import { describe, expect, it } from 'vitest';
 import type { UnitOfWork } from '@tef/application';
 import { markDispatched, money, type PaymentState, type TenantId } from '@tef/domain';
 import { SIMULATOR_DIRECTIVES, type SimulatorDirective } from '@tef/provider-simulator';
-import { testRuntime } from './async.ts';
+import { newClock, TEST_RECONCILE_DELAY_MS, testRuntime } from './async.ts';
 import { createCommand, ctxA, newKey, sleep } from './harness.ts';
 
 export interface AsyncBackend {
   readonly name: string;
-  readonly uow: () => Promise<UnitOfWork>;
+  /** Unidade de trabalho; em memória, a fila usa `clock` como relógio (no PostgreSQL, o do banco). */
+  readonly uow: (clock: { ms: number }) => Promise<UnitOfWork>;
+  /**
+   * Faz o tempo DA FILA passar `ms` (ADR 0019). Em memória: avança o relógio injetado.
+   * No PostgreSQL, cujo relógio é `clock_timestamp()`, espera de verdade (e avança também
+   * o relógio do processo, para os fatos de negócio continuarem coerentes).
+   */
+  readonly advanceQueue: (clock: { ms: number }, ms: number) => Promise<void>;
   /** Quantas vezes a operação foi marcada como enviada (auditoria). */
   readonly dispatchCount: (tenantId: TenantId, operationId: string) => Promise<number>;
   /** Quantas vezes um resultado foi registrado para a operação (auditoria). */
   readonly resultCount: (tenantId: TenantId, operationId: string) => Promise<number>;
 }
 
+/**
+ * Leases curtos nos testes que fazem o lease expirar: no PostgreSQL o tempo da fila é real
+ * (`clock_timestamp()`), então os prazos são de centenas de milissegundos, com folga de
+ * 200 ms entre cada verificação e o vencimento.
+ */
+const SHORT_LEASE_MS = 600;
+const PAST_SHORT_LEASE_MS = 800;
+const RECONCILE_WAIT_MS = 3 * TEST_RECONCILE_DELAY_MS;
+
 /** Comportamento do modelo assíncrono (API aceita, worker executa), em memória e no PostgreSQL. */
 export function describeAsyncSuite(backend: AsyncBackend): void {
   describe(`[${backend.name}] criação assíncrona e worker`, () => {
     it('criação com autorização grava pagamento, operação PENDING e tarefa; nada vai ao provedor antes do worker', async () => {
-      const uow = await backend.uow();
-      const rt = testRuntime(uow);
+      const clock = newClock();
+      const uow = await backend.uow(clock);
+      const rt = testRuntime(uow, { clock });
       const created = await rt.service.createPayment(ctxA, { ...createCommand(), authorize: true }, newKey());
       expect(created.responseStatus).toBe(202);
       expect(created.payment.state).toBe('PROCESSING');
@@ -39,8 +56,9 @@ export function describeAsyncSuite(backend: AsyncBackend): void {
     });
 
     it('repetição da criação (mesma chave) não cria segunda tarefa nem segundo envio', async () => {
-      const uow = await backend.uow();
-      const rt = testRuntime(uow);
+      const clock = newClock();
+      const uow = await backend.uow(clock);
+      const rt = testRuntime(uow, { clock });
       const key = newKey();
       const command = { ...createCommand(), authorize: true };
       const first = await rt.service.createPayment(ctxA, command, key);
@@ -53,10 +71,11 @@ export function describeAsyncSuite(backend: AsyncBackend): void {
     });
 
     it('tarefa entregue duas vezes: a segunda execução não reenvia', async () => {
-      const uow = await backend.uow();
-      const rt = testRuntime(uow);
+      const clock = newClock();
+      const uow = await backend.uow(clock);
+      const rt = testRuntime(uow, { clock });
       const created = await rt.service.createPayment(ctxA, { ...createCommand(), authorize: true }, newKey());
-      const [job] = await uow.transaction((r) => r.jobs.claim('worker-a', 10, 5_000, new Date(rt.clock.ms)));
+      const [job] = await uow.transaction((r) => r.jobs.claim('worker-a', 10, 5_000));
       expect(job).toBeDefined();
       const actor = { type: 'SYSTEM' as const, id: 'test' };
       const lease = { workerId: 'worker-a', leaseMs: 5_000 };
@@ -67,35 +86,35 @@ export function describeAsyncSuite(backend: AsyncBackend): void {
     });
 
     it('worker cai ANTES do envio: o lease expira, outro worker assume e envia uma única vez', async () => {
-      const uow = await backend.uow();
-      const clock = { ms: Date.parse('2026-10-18T12:00:00.000Z') };
+      const clock = newClock();
+      const uow = await backend.uow(clock);
       const a = testRuntime(uow, { workerId: 'worker-a', clock });
       const b = testRuntime(uow, { workerId: 'worker-b', clock });
       const created = await a.service.createPayment(ctxA, { ...createCommand(), authorize: true }, newKey());
-      const claimed = await uow.transaction((r) => r.jobs.claim('worker-a', 10, 2_000, new Date(clock.ms)));
+      const claimed = await uow.transaction((r) => r.jobs.claim('worker-a', 10, SHORT_LEASE_MS));
       expect(claimed).toHaveLength(1);
       // worker-a "morre" aqui. Antes do lease expirar, ninguém pega a tarefa:
       expect((await b.worker.runOnce()).jobs).toBe(0);
-      clock.ms += 5_000;
+      await backend.advanceQueue(clock, PAST_SHORT_LEASE_MS);
       expect((await b.worker.runOnce()).jobs).toBe(1);
       expect((await b.service.getPayment(ctxA, created.payment.id)).payment.state).toBe('APPROVED');
       expect(a.simulator.receivedCount() + b.simulator.receivedCount()).toBe(1);
       const [job] = await uow.transaction((r) => r.jobs.listByPayment(ctxA.tenantId, created.payment.id));
       expect(job).toMatchObject({ status: 'DONE', attempts: 2 });
       // Fencing: o worker antigo não consegue concluir uma tarefa que já não é dele.
-      expect(await uow.transaction((r) => r.jobs.complete(job!.id, 'worker-a', new Date(clock.ms)))).toBe(false);
+      expect(await uow.transaction((r) => r.jobs.complete(job!.id, 'worker-a'))).toBe(false);
     });
 
     it('fencing: worker com lease expirado e tarefa reassumida não envia nem altera a operação', async () => {
-      const uow = await backend.uow();
-      const clock = { ms: Date.parse('2026-10-18T12:00:00.000Z') };
+      const clock = newClock();
+      const uow = await backend.uow(clock);
       const a = testRuntime(uow, { workerId: 'worker-a', clock });
       const b = testRuntime(uow, { workerId: 'worker-b', clock });
       const created = await a.service.createPayment(ctxA, { ...createCommand(), authorize: true }, newKey());
-      const [jobA] = await uow.transaction((r) => r.jobs.claim('worker-a', 10, 2_000, new Date(clock.ms)));
+      const [jobA] = await uow.transaction((r) => r.jobs.claim('worker-a', 10, SHORT_LEASE_MS));
       // worker-a "congela"; o lease expira e worker-b reassume a tarefa.
-      clock.ms += 5_000;
-      const [jobB] = await uow.transaction((r) => r.jobs.claim('worker-b', 10, 2_000, new Date(clock.ms)));
+      await backend.advanceQueue(clock, PAST_SHORT_LEASE_MS);
+      const [jobB] = await uow.transaction((r) => r.jobs.claim('worker-b', 10, 2_000));
       expect(jobB?.id).toBe(jobA?.id);
 
       // worker-a volta: não pode enviar nem marcar nada.
@@ -112,33 +131,35 @@ export function describeAsyncSuite(backend: AsyncBackend): void {
     });
 
     it('lease é renovado no início do processamento (posse estendida a partir de agora)', async () => {
-      const uow = await backend.uow();
-      const clock = { ms: Date.parse('2026-10-18T12:00:00.000Z') };
+      const clock = newClock();
+      const uow = await backend.uow(clock);
       const rt = testRuntime(uow, { workerId: 'worker-r', clock });
       await rt.service.createPayment(ctxA, { ...createCommand(), authorize: true }, newKey());
-      const [job] = await uow.transaction((r) => r.jobs.claim('worker-r', 10, 2_000, new Date(clock.ms)));
-      clock.ms += 1_500; // ainda dentro do lease original
-      expect(await uow.transaction((r) => r.jobs.renewLease(job!.id, 'worker-r', 2_000, new Date(clock.ms)))).toBe(true);
-      clock.ms += 1_500; // passaria do lease original, mas não do renovado
-      expect(await uow.transaction((r) => r.jobs.claim('intruso', 10, 2_000, new Date(clock.ms)))).toHaveLength(0);
-      clock.ms += 1_000; // agora expirou
-      expect(await uow.transaction((r) => r.jobs.renewLease(job!.id, 'worker-r', 2_000, new Date(clock.ms)))).toBe(false);
+      const [job] = await uow.transaction((r) => r.jobs.claim('worker-r', 10, SHORT_LEASE_MS));
+      await backend.advanceQueue(clock, 300); // ainda dentro do lease original (600)
+      expect(await uow.transaction((r) => r.jobs.renewLease(job!.id, 'worker-r', SHORT_LEASE_MS))).toBe(true); // vence em ~900
+      await backend.advanceQueue(clock, 400); // ~700: passaria do lease original, mas não do renovado
+      expect(await uow.transaction((r) => r.jobs.claim('intruso', 10, 2_000))).toHaveLength(0);
+      await backend.advanceQueue(clock, 400); // ~1100: agora expirou
+      // Renovação não ressuscita lease vencido, e conclusão após o vencimento é recusada.
+      expect(await uow.transaction((r) => r.jobs.renewLease(job!.id, 'worker-r', SHORT_LEASE_MS))).toBe(false);
+      expect(await uow.transaction((r) => r.jobs.complete(job!.id, 'worker-r'))).toBe(false);
       // Limpeza: o lease expirado é retomado e a tarefa é processada (não deixa trabalho para outros testes).
       await rt.worker.runOnce();
     });
 
     it('worker cai DEPOIS do envio: operação vira UNKNOWN, nunca é reenviada, e a consulta resolve', async () => {
-      const uow = await backend.uow();
-      const clock = { ms: Date.parse('2026-10-18T12:00:00.000Z') };
+      const clock = newClock();
+      const uow = await backend.uow(clock);
       const rt = testRuntime(uow, { workerId: 'worker-b', clock });
       const created = await rt.service.createPayment(ctxA, { ...createCommand(), authorize: true }, newKey());
       // Simula o worker-a: reivindica, marca IN_FLIGHT e cai antes de registrar o resultado.
-      await uow.transaction((r) => r.jobs.claim('worker-a', 10, 2_000, new Date(clock.ms)));
+      await uow.transaction((r) => r.jobs.claim('worker-a', 10, SHORT_LEASE_MS));
       await uow.transaction(async (r) => {
         const op = await r.operations.findById(ctxA.tenantId, created.operations[0]!.id);
         await r.operations.update(markDispatched(op!, rt.simulator.capabilities, new Date(clock.ms)), op!.version);
       });
-      clock.ms += 5_000;
+      await backend.advanceQueue(clock, PAST_SHORT_LEASE_MS);
       await rt.worker.runOnce();
       let view = await rt.service.getPayment(ctxA, created.payment.id);
       expect(view.payment.state).toBe('UNKNOWN');
@@ -149,7 +170,7 @@ export function describeAsyncSuite(backend: AsyncBackend): void {
       expect(jobs.map((j) => `${j.kind}:${j.status}`)).toEqual(['EXECUTE_OPERATION:DONE', 'RECONCILE_OPERATION:PENDING']);
 
       // Reconciliação: o provedor (simulado) nunca recebeu -> "não encontrado" definitivo -> CANCELLED.
-      clock.ms += 10_000;
+      await backend.advanceQueue(clock, RECONCILE_WAIT_MS);
       await rt.worker.runOnce();
       view = await rt.service.getPayment(ctxA, created.payment.id);
       expect(view.payment.state).toBe('CANCELLED');
@@ -158,8 +179,9 @@ export function describeAsyncSuite(backend: AsyncBackend): void {
     });
 
     it('UNKNOWN após envio: o worker só consulta (sem nova cobrança) até resolver', async () => {
-      const uow = await backend.uow();
-      const rt = testRuntime(uow);
+      const clock = newClock();
+      const uow = await backend.uow(clock);
+      const rt = testRuntime(uow, { clock });
       const created = await rt.service.createPayment(ctxA, { ...createCommand(), authorize: true, testDirective: 'TIMEOUT_AFTER_SEND' }, newKey());
       await rt.worker.runOnce();
       expect((await rt.service.getPayment(ctxA, created.payment.id)).payment.state).toBe('UNKNOWN');
@@ -167,7 +189,7 @@ export function describeAsyncSuite(backend: AsyncBackend): void {
       await expect(rt.service.requestOperation(ctxA, created.payment.id, 'AUTHORIZATION', undefined, newKey())).rejects.toMatchObject({
         code: 'OPERATION_IN_PROGRESS',
       });
-      rt.clock.ms += 10_000;
+      await backend.advanceQueue(rt.clock, RECONCILE_WAIT_MS);
       await rt.worker.runOnce();
       const view = await rt.service.getPayment(ctxA, created.payment.id);
       expect(view.payment.state).toBe('APPROVED');
@@ -176,8 +198,9 @@ export function describeAsyncSuite(backend: AsyncBackend): void {
     });
 
     it('reconciliação e resposta original concorrentes: um único resultado registrado, sem conflito', async () => {
-      const uow = await backend.uow();
-      const rt = testRuntime(uow);
+      const clock = newClock();
+      const uow = await backend.uow(clock);
+      const rt = testRuntime(uow, { clock });
       const created = await rt.service.createPayment(ctxA, { ...createCommand(), authorize: true, testDirective: 'UNKNOWN_THEN_RECONCILED' }, newKey());
       await rt.worker.runOnce();
       const view = await rt.service.getPayment(ctxA, created.payment.id);
@@ -200,8 +223,9 @@ export function describeAsyncSuite(backend: AsyncBackend): void {
     });
 
     it('operações solicitadas pela API (estorno, cancelamento) também passam pela fila', async () => {
-      const uow = await backend.uow();
-      const rt = testRuntime(uow);
+      const clock = newClock();
+      const uow = await backend.uow(clock);
+      const rt = testRuntime(uow, { clock });
       const created = await rt.service.createPayment(ctxA, { ...createCommand(10_000), authorize: true }, newKey());
       await rt.worker.runOnce();
       const refund = await rt.service.requestOperation(ctxA, created.payment.id, 'REFUND', money(4_000), newKey());
@@ -219,8 +243,9 @@ export function describeAsyncSuite(backend: AsyncBackend): void {
     });
 
     it('outbox: publica cada evento uma vez; falha do destino agenda nova tentativa sem perder o evento', async () => {
-      const uow = await backend.uow();
-      const rt = testRuntime(uow);
+      const clock = newClock();
+      const uow = await backend.uow(clock);
+      const rt = testRuntime(uow, { clock });
       const created = await rt.service.createPayment(ctxA, { ...createCommand(), authorize: true }, newKey());
       rt.sink.failNext = 1;
       await rt.worker.runOnce();
@@ -238,8 +263,9 @@ export function describeAsyncSuite(backend: AsyncBackend): void {
     });
 
     it('encerramento gracioso registra STOPPED no batimento', async () => {
-      const uow = await backend.uow();
-      const rt = testRuntime(uow, { workerId: `worker-stop-${Date.now()}` });
+      const clock = newClock();
+      const uow = await backend.uow(clock);
+      const rt = testRuntime(uow, { workerId: `worker-stop-${Date.now()}`, clock });
       rt.worker.start();
       await sleep(30);
       await rt.worker.stop();
@@ -268,8 +294,9 @@ export function describeAsyncSuite(backend: AsyncBackend): void {
 
     for (const directive of Object.keys(expected) as SimulatorDirective[]) {
       it(`${directive}: ${SIMULATOR_DIRECTIVES[directive].expected}`, async () => {
-        const uow = await backend.uow();
-        const rt = testRuntime(uow);
+        const clock = newClock();
+        const uow = await backend.uow(clock);
+        const rt = testRuntime(uow, { clock });
         const created = await rt.service.createPayment(ctxA, { ...createCommand(), authorize: true, testDirective: directive }, newKey());
         await rt.worker.runOnce();
         const first = await rt.service.getPayment(ctxA, created.payment.id);
@@ -277,7 +304,7 @@ export function describeAsyncSuite(backend: AsyncBackend): void {
 
         // Deixa notificações atrasadas chegarem e roda a reconciliação agendada.
         await sleep(250);
-        rt.clock.ms += 10_000;
+        await backend.advanceQueue(rt.clock, RECONCILE_WAIT_MS);
         await rt.worker.runOnce();
         const final = await rt.service.getPayment(ctxA, created.payment.id);
         expect(final.payment.state).toBe(expected[directive].final);
