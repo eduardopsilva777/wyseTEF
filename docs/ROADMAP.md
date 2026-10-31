@@ -17,18 +17,21 @@
 2. Autenticação provisória por chave de API, revogação só com reinício; sem rate limiting. Por isso a API só escuta em loopback (ADR 0009).
 3. Worker implementado (F2A). A outbox é publicada apenas para o log estruturado; não há entrega a clientes (webhooks). Resolução manual ainda não tem rota HTTP.
 4. Sem expurgo de chaves de idempotência.
-5. Auditoria sem ancoragem externa; papel de banco da aplicação ainda é o dono das tabelas em desenvolvimento.
+5. Auditoria sem ancoragem externa. (O papel da aplicação deixou de ser o dono das tabelas na F2B/I2, ADR 0020.)
 6. Sem RLS no PostgreSQL (isolamento por filtro em todas as consultas).
 7. Sem empacotamento de produção (ADR 0010).
 8. Desfazimento de autorização UNKNOWN e resolução de pagamento UNKNOWN sem operação aberta não implementados.
 9. Estado fiscal não modelado.
-10. CI definido em `.github/workflows/ci.yml`, mas **nunca executado** (não há repositório remoto). Actions referenciadas por tag, não por SHA; sem gitleaks nem SAST dedicado.
+10. CI definido em `.github/workflows/ci.yml`, mas **nunca executado** (não há repositório remoto). Desde a F2B/I2: actions fixadas por SHA, Gitleaks fixado e E2E com Chromium; ainda sem SAST dedicado e com a imagem do PostgreSQL referenciada por tag.
 11. Isolamento por estabelecimento é aplicado na camada HTTP; aplicação e banco isolam por tenant.
 12. Acesso administrativo apenas de desenvolvimento local (ADR 0015): sem usuários, MFA ou RBAC.
 13. ~~Lease e `available_at` usam o relógio da aplicação~~ — resolvido na F2B/I1 (ADR 0019): decisões da fila pelo relógio do PostgreSQL. Resta depender do NTP do servidor de banco; batimento do worker e agendamento da outbox continuam no relógio do processo (sem efeito sobre segurança).
 14. Tarefas `FAILED` (tentativas esgotadas) não têm rotina de saneamento; aparecem no painel.
 15. Painel sem testes automatizados de componentes nem testes Playwright versionados; validado no navegador com playwright-cli (manual) e por testes da API administrativa e verificações estáticas. Recomendado para a F2: Playwright com 5 fluxos (login, CRUD de cliente, pagamento simulado com aprovação, UNKNOWN reconciliado, falha da API exibida) e testes de componentes para formulários e selo de estado.
 16. `recoverStaleInFlight` deve ser chamado com limite maior que o timeout do provedor; uma recuperação prematura marca UNKNOWN cedo demais (sem reenvio; a resposta real ainda resolve a operação — coberto por teste no PostgreSQL), mas não há proteção automática contra configuração errada. Desde a ADR 0019, a varredura ignora operações cuja tarefa ainda detém lease válido pelo relógio do banco.
+
+## F2B / I2 — perfis de ambiente, papéis de banco e CI (2026-10-19)
+`TEF_ENV` (dev/test/staging/prod) com matriz validada na inicialização; identidades `tef_owner` (migrações), `tef_app` (API) e `tef_worker` (worker) com GRANTs específicos na migração 0005 e bootstrap local (`npm run db:bootstrap`); verificação da identidade de banco na subida; cookie `Secure` em staging/prod; workflow de CI com actions por SHA, Gitleaks e E2E. Testes reais de privilégio em `tests/integration/postgres-roles.test.ts`. Detalhes em `docs/OPERATIONS.md` e na ADR 0020.
 
 ## F2B / I1 — relógio do PostgreSQL na fila (2026-10-19)
 Fila e leases decididos por `clock_timestamp()`; contrato da fila com durações em vez de instantes; conclusão e reagendamento exigem lease válido; varredura de `IN_FLIGHT` respeita a posse de tarefa ativa. Testes no PostgreSQL com relógios de processo divergentes (±1 h) em `tests/integration/postgres-queue-clock.test.ts`. Sem migração.

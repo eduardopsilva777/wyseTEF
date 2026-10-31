@@ -48,7 +48,7 @@ A direção de produto controla escopo e aprova decisões arquiteturais relevant
 - Monólito modular hexagonal. `domain` não faz I/O (o lint impede). Adaptadores traduzem; não decidem estado.
 - Sem microsserviços nem abstrações especulativas.
 - Novo provedor: implementar `PaymentProvider`, declarar capacidades a partir da documentação oficial (na dúvida, `false`) e passar em `runProviderConformanceSuite`.
-- Mudança de esquema: nova migração em `packages/persistence/migrations/NNNN_*.sql`. Nunca editar migração já aplicada.
+- Mudança de esquema: nova migração em `packages/persistence/migrations/NNNN_*.sql`. Nunca editar migração já aplicada. Tabela nova traz na mesma migração os GRANTs mínimos para `tef_app`/`tef_worker`; API e worker nunca rodam como dono do schema nem superusuário (ADR 0020, `docs/OPERATIONS.md`).
 - Decisão relevante: nova ADR numerada em `docs/decisions/`, marcando claramente o que é provisório.
 - Linguagem e estratégia offline do agente local continuam pendentes até análise do SDK oficial (ADR 0011).
 

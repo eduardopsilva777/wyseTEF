@@ -32,3 +32,28 @@ describe('configuração do worker', () => {
     }
   });
 });
+
+describe('perfis de ambiente no worker (ADR 0020)', () => {
+  const url = (user: string, query = '') => [`postgres://${user}`, `senha-ficticia@db.interno:5432/tef${query}`].join(':');
+
+  it('dev/test aceitam DATABASE_URL como identidade do worker (compatibilidade), preferindo TEF_WORKER_DATABASE_URL', () => {
+    expect(loadWorkerConfig({ TEF_ENV: 'dev', DATABASE_URL: url('tef_app') }).databaseUrl).toBe(url('tef_app'));
+    expect(loadWorkerConfig({ TEF_ENV: 'test', DATABASE_URL: url('tef_app'), TEF_WORKER_DATABASE_URL: url('tef_worker') }).databaseUrl).toBe(url('tef_worker'));
+  });
+
+  it('staging válido exige TEF_WORKER_DATABASE_URL com TLS e identidade distinta da API', () => {
+    const ok = loadWorkerConfig({ TEF_ENV: 'staging', TEF_WORKER_DATABASE_URL: url('tef_worker', '?sslmode=require'), DATABASE_URL: url('tef_app', '?sslmode=require') });
+    expect(ok.env.env).toBe('staging');
+    expect(() => loadWorkerConfig({ TEF_ENV: 'staging', DATABASE_URL: url('tef_app', '?sslmode=require') })).toThrow(/TEF_WORKER_DATABASE_URL: obrigatório em staging/);
+    expect(() => loadWorkerConfig({ TEF_ENV: 'staging', TEF_WORKER_DATABASE_URL: url('tef_worker') })).toThrow(/sslmode=require/);
+    expect(() =>
+      loadWorkerConfig({ TEF_ENV: 'staging', TEF_WORKER_DATABASE_URL: url('tef_app', '?sslmode=require'), DATABASE_URL: url('tef_app', '?sslmode=require') }),
+    ).toThrow(/identidade de banco distinta/);
+    expect(() => loadWorkerConfig({ TEF_ENV: 'staging', TEF_WORKER_DATABASE_URL: url('tef_worker', '?sslmode=require'), LOG_LEVEL: 'trace' })).toThrow(/debug\/trace/);
+  });
+
+  it('prod recusa o simulador e NODE_ENV contraditório', () => {
+    expect(() => loadWorkerConfig({ TEF_ENV: 'prod', TEF_WORKER_DATABASE_URL: url('tef_worker', '?sslmode=verify-full') })).toThrow(/simulador não é permitido em produção/);
+    expect(() => loadWorkerConfig({ TEF_ENV: 'dev', NODE_ENV: 'production', DATABASE_URL: url('tef_app') })).toThrow(/contradiz/);
+  });
+});

@@ -1,8 +1,9 @@
 import { AdminService, PaymentService, type UnitOfWork } from '@tef/application';
 import { InMemoryUnitOfWork } from '@tef/persistence/memory';
-import { createPgPool, PgUnitOfWork } from '@tef/persistence/postgres';
+import { createPgPool, DB_ROLES, inspectRuntimeIdentity, PgUnitOfWork } from '@tef/persistence/postgres';
 import { createProviderRegistry } from '@tef/provider-contract';
 import { PaymentSimulator, SIMULATOR_PROVIDER_ID } from '@tef/provider-simulator';
+import { adminCookiePolicy } from '@tef/config';
 import { DevAdminAuth } from './admin-auth.ts';
 import { buildApp } from './app.ts';
 import { createAuthenticator } from './auth.ts';
@@ -18,6 +19,7 @@ try {
 }
 
 const logger = createLogger(config.LOG_LEVEL, config.NODE_ENV === 'production');
+logger.info({ tefEnv: config.env.env }, 'perfil de ambiente');
 
 let uow: UnitOfWork;
 let closeDb = async (): Promise<void> => {};
@@ -27,6 +29,18 @@ if (config.TEF_PERSISTENCE === 'postgres' && config.DATABASE_URL) {
   pool.on('error', (error) => logger.error({ err: error }, 'erro em conexão ociosa do PostgreSQL'));
   uow = new PgUnitOfWork(pool);
   closeDb = () => pool.end();
+  // Identidade restrita (ADR 0020): a API não pode rodar como dono do schema ou superusuário.
+  if (config.env.identityCheck !== 'off') {
+    const report = await inspectRuntimeIdentity(pool, DB_ROLES.app).catch(() => ({ user: 'desconhecido', violations: ['não foi possível verificar a identidade de banco'] }));
+    if (report.violations.length > 0) {
+      if (config.env.identityCheck === 'enforce') {
+        logger.fatal({ tefEnv: config.env.env, violations: report.violations }, 'identidade de banco da API recusada');
+        await pool.end();
+        process.exit(1);
+      }
+      logger.warn({ tefEnv: config.env.env, violations: report.violations }, 'identidade de banco da API não é a restrita (tef_app): rode npm run dev:setup e npm run db:bootstrap');
+    }
+  }
 } else {
   logger.warn({}, 'persistência EM MEMÓRIA: dados são perdidos ao reiniciar e não há worker (somente desenvolvimento)');
   uow = new InMemoryUnitOfWork();
@@ -44,6 +58,7 @@ const admin = config.TEF_DEV_ADMIN_TOKEN_SHA256
       auth: new DevAdminAuth({ tokenSha256: config.TEF_DEV_ADMIN_TOKEN_SHA256 }),
       service: new AdminService({ uow, providers }),
       allowedOrigins: config.TEF_ADMIN_ALLOWED_ORIGINS,
+      cookie: adminCookiePolicy(config.env),
     }
   : undefined;
 if (admin) {

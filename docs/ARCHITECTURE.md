@@ -42,7 +42,9 @@
 | `apps/web` | Painel React local: dashboard, clientes, estabelecimentos, terminais, transações, simulador, auditoria, área reservada de usuários. | implementado |
 | Agente local | Execução presencial quando exigida pelo provedor (ADR 0011). | planejado |
 | Adaptadores oficiais | Um por provedor, com contrato e documentação oficial. | planejado |
-| Autenticação de produção, RBAC, MFA, rate limiting | | planejado |
+| `packages/config` | Perfis de ambiente (`TEF_ENV`), política de cada perfil, verificação de URLs do banco e política de cookie (ADR 0020). | implementado |
+| Identidades do PostgreSQL | `tef_owner` (migrações), `tef_app` (API), `tef_worker` (worker); GRANTs na 0005; bootstrap local; verificação na inicialização (ADR 0020). | implementado |
+| Autenticação de produção, RBAC, MFA, rate limiting, RLS | | planejado |
 
 ## Fluxo assíncrono de um pagamento (implementado)
 

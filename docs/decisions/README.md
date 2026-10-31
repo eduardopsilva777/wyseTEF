@@ -26,3 +26,4 @@ Status possíveis: **Aceita**, **Provisória** (vale até a condição de revis�
 | [0017](0017-painel-web-local.md) | Painel web local (React + Vite) sem segredos no navegador | Aceita |
 | [0018](0018-pacote-observability.md) | Logger sanitizado compartilhado (@tef/observability) | Aceita |
 | [0019](0019-relogio-do-banco-na-fila.md) | Relógio do PostgreSQL como autoridade temporal da fila (altera a consequência de relógio da 0013) | Aceita |
+| [0020](0020-perfis-de-ambiente-e-papeis-de-banco.md) | Perfis de ambiente (TEF_ENV) e identidades restritas no PostgreSQL (tef_owner, tef_app, tef_worker) | Aceita |

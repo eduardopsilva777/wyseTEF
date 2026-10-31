@@ -13,7 +13,7 @@
 O encadeamento **detecta** alteração, remoção ou reordenação; ele **não impede** que alguém com privilégio de dono da tabela ou de superusuário desative o gatilho e reescreva a cadeia inteira.
 
 Controles complementares necessários (pendentes):
-- papel de aplicação sem privilégios de DDL nem de dono das tabelas;
+- papel de aplicação sem privilégios de DDL nem de dono das tabelas (**implementado na F2B/I2, ADR 0020**: `tef_app` e `tef_worker` não alteram nem desligam o gatilho);
 - ancoragem periódica do hash da cabeça em armazenamento externo imutável (WORM);
 - verificação agendada da cadeia, com alertas.
 

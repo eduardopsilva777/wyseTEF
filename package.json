@@ -9,6 +9,7 @@
   "workspaces": [
     "packages/domain",
     "packages/audit",
+    "packages/config",
     "packages/observability",
     "packages/application",
     "packages/providers/contract",
@@ -26,6 +27,7 @@
     "test:db": "node scripts/test-db.mjs",
     "db:up": "docker compose -f infra/dev/docker-compose.yml --env-file .env up -d --wait",
     "db:down": "docker compose -f infra/dev/docker-compose.yml --env-file .env down",
+    "db:bootstrap": "node --env-file-if-exists=.env packages/persistence/src/cli/bootstrap.ts",
     "db:migrate": "node --env-file-if-exists=.env packages/persistence/src/cli/migrate.ts",
     "dev:api": "node --watch apps/api/src/main.ts",
     "check:secrets": "node scripts/check-secrets.mjs",

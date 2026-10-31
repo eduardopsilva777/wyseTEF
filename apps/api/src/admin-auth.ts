@@ -1,4 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { adminCookiePolicy, policyFor, type CookiePolicy } from '@tef/config';
 
 /**
  * ACESSO ADMINISTRATIVO DE DESENVOLVIMENTO LOCAL (ver docs/decisions/0015).
@@ -10,7 +11,9 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
  * - O token nunca vai para o JavaScript do painel nem para variáveis VITE_.
  * - Não é a autenticação de produção: não há usuários, MFA nem RBAC.
  */
-export const ADMIN_SESSION_COOKIE = 'tef_dev_admin';
+/** Política padrão (perfil dev): cookie sem `Secure`, pois o painel local roda em http://127.0.0.1. */
+export const DEV_COOKIE_POLICY: CookiePolicy = adminCookiePolicy(policyFor('dev'));
+export const ADMIN_SESSION_COOKIE = DEV_COOKIE_POLICY.name;
 export const ADMIN_CSRF_HEADER = 'x-tef-admin';
 
 export interface AdminSession {
@@ -102,11 +105,17 @@ export function readCookie(header: string | undefined, name: string): string | u
   return undefined;
 }
 
-export function sessionCookie(sessionId: string, maxAgeSeconds: number): string {
-  // Sem `Secure` porque o painel local roda em http://127.0.0.1; ver ADR 0015.
-  return `${ADMIN_SESSION_COOKIE}=${sessionId}; Path=/admin; HttpOnly; SameSite=Strict; Max-Age=${maxAgeSeconds}`;
+const cookieAttributes = (policy: CookiePolicy): string =>
+  `Path=${policy.path}; HttpOnly; SameSite=${policy.sameSite}${policy.secure ? '; Secure' : ''}`;
+
+/**
+ * Cookie da sessão administrativa conforme o perfil (ADR 0020): em staging/prod,
+ * `Secure` e prefixo `__Secure-`; `HttpOnly` e `SameSite=Strict` sempre.
+ */
+export function sessionCookie(sessionId: string, maxAgeSeconds: number, policy: CookiePolicy = DEV_COOKIE_POLICY): string {
+  return `${policy.name}=${sessionId}; ${cookieAttributes(policy)}; Max-Age=${maxAgeSeconds}`;
 }
 
-export function clearedSessionCookie(): string {
-  return `${ADMIN_SESSION_COOKIE}=; Path=/admin; HttpOnly; SameSite=Strict; Max-Age=0`;
+export function clearedSessionCookie(policy: CookiePolicy = DEV_COOKIE_POLICY): string {
+  return `${policy.name}=; ${cookieAttributes(policy)}; Max-Age=0`;
 }

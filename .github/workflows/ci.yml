@@ -1,4 +1,6 @@
-# Validação contínua. Definido na F1, mas ainda NÃO executado (não há repositório remoto).
+# Validação contínua (ADR 0020). Pronta para execução, mas ainda NÃO executada em serviço
+# de CI: o repositório não tem remoto. Actions fixadas por SHA completo e ferramentas
+# baixadas com SHA-256 verificado (versões conferidas nos releases oficiais em 2026-10-19).
 name: ci
 
 on:
@@ -8,36 +10,86 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb" # gitleaks_8.30.1_linux_x64.tar.gz
+
 jobs:
+  secrets:
+    name: Segredos introduzidos (Gitleaks)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Instalar Gitleaks (binário fixado, SHA-256 verificado)
+        run: |
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl -sSfL -o "$archive" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  ${archive}" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
+      - name: Varredura dos commits introduzidos (PR ou push)
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          # Sem base válida (primeiro push, branch nova): varre o histórico inteiro.
+          range=()
+          if [ -n "$BASE_SHA" ] && [ "$BASE_SHA" != "0000000000000000000000000000000000000000" ] && git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            range=("--log-opts=${BASE_SHA}..${GITHUB_SHA}")
+          fi
+          "$RUNNER_TEMP/gitleaks" git --no-banner --redact --exit-code 1 --config .gitleaks.toml "${range[@]}" .
+
   verify:
-    runs-on: ubuntu-latest
+    name: Lint, tipos, testes, PostgreSQL, bundle, segredos, dependências e E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:18-alpine
         env:
           POSTGRES_USER: ci
-          POSTGRES_PASSWORD: ${{ github.run_id }}-ci-only
+          # Banco efêmero do runner, acessível só nele; não é segredo de nenhum ambiente.
+          POSTGRES_PASSWORD: ci-${{ github.run_id }}-${{ github.run_attempt }}
           POSTGRES_DB: tef_ci
         ports: ["5432:5432"]
         options: >-
           --health-cmd "pg_isready -U ci -d tef_ci" --health-interval 2s --health-timeout 3s --health-retries 30
+    env:
+      CI: "true"
+      TEF_ENV: test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
-      - uses: actions/setup-node@v4
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
           cache: npm
-      - run: npm ci
+      - name: Dependências (reprodutível, a partir do package-lock.json)
+        run: npm ci
       - run: npm run lint
       - run: npm run typecheck
-      - run: npm test
-      - name: Testes de integração (PostgreSQL)
+      - name: Testes unitários (os de PostgreSQL ficam para o passo seguinte)
+        run: npm test
+      - name: Testes de integração (PostgreSQL real, identidades tef_owner/tef_app/tef_worker)
         run: npm run test:db
         env:
-          TEST_DATABASE_URL: postgres://ci:${{ github.run_id }}-ci-only@127.0.0.1:5432/tef_ci
-      - run: npm run check:web
+          TEST_DATABASE_URL: postgres://ci:ci-${{ github.run_id }}-${{ github.run_attempt }}@127.0.0.1:5432/tef_ci
+      - name: Bundle do painel sem segredos
+        run: npm run check:web
       - run: npm run check:secrets
-      - run: npm run check:deps
-      # Recomendado antes do piloto: gitleaks (histórico completo) e SAST dedicado.
+      - name: Auditoria de dependências
+        run: npm run check:deps
+      - name: Chromium do Playwright (versão fixada no package-lock.json)
+        run: npx playwright install --with-deps chromium
+      - name: Testes E2E (dados fictícios, banco descartável, sem trace nem artefatos)
+        run: npm run test:e2e
+        env:
+          TEST_DATABASE_URL: postgres://ci:ci-${{ github.run_id }}-${{ github.run_attempt }}@127.0.0.1:5432/tef_ci
+          PW_CHANNEL: chromium

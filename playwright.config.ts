@@ -3,7 +3,12 @@ import { defineConfig, devices } from '@playwright/test';
 /**
  * Testes ponta a ponta do painel WyseTEF. Rode com `npm run test:e2e`: o script prepara
  * um banco descartável e credenciais aleatórias e repassa tudo por variáveis de ambiente.
- * Usa o navegador instalado no sistema (Edge por padrão; PW_CHANNEL=chrome para Chrome).
+ * Navegador: Edge instalado no sistema por padrão; PW_CHANNEL=chrome (Chrome) ou
+ * PW_CHANNEL=chromium (Chromium do Playwright, usado no CI).
+ *
+ * Segredos (ADR 0020): o token do painel é digitado no login, então traces gravariam o
+ * valor; no CI o trace fica DESLIGADO e nenhum artefato é publicado. Localmente, traces
+ * de falha ficam em test-results/ (ignorado pelo Git) e o token morre com a execução.
  */
 const required = (name: string): string => {
   const value = process.env[name];
@@ -14,7 +19,10 @@ const required = (name: string): string => {
 const API_PORT = 3100;
 const WORKER_HEALTH_PORT = 3101;
 const WEB_PORT = 5180;
-const base = { ...process.env } as Record<string, string>;
+const CI = Boolean(process.env['CI']);
+const channel = process.env['PW_CHANNEL'] ?? 'msedge';
+// Ambiente dos servidores sem os segredos dos testes (o token só existe no processo de teste).
+const base = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('E2E_'))) as Record<string, string>;
 
 export default defineConfig({
   testDir: 'e2e',
@@ -23,17 +31,18 @@ export default defineConfig({
   retries: 0,
   timeout: 60_000,
   expect: { timeout: 15_000 },
+  forbidOnly: CI,
   reporter: [['list']],
   outputDir: 'test-results',
   use: {
     baseURL: `http://127.0.0.1:${WEB_PORT}`,
-    channel: process.env['PW_CHANNEL'] ?? 'msedge',
-    trace: 'retain-on-failure',
-    screenshot: 'only-on-failure',
+    channel,
+    trace: CI ? 'off' : 'retain-on-failure',
+    screenshot: CI ? 'off' : 'only-on-failure',
     locale: 'pt-BR',
     timezoneId: 'America/Sao_Paulo',
   },
-  projects: [{ name: 'desktop', use: { ...devices['Desktop Edge'], channel: process.env['PW_CHANNEL'] ?? 'msedge', viewport: { width: 1440, height: 900 } } }],
+  projects: [{ name: 'desktop', use: { ...devices['Desktop Edge'], channel, viewport: { width: 1440, height: 900 } } }],
   webServer: [
     {
       command: 'node apps/api/src/main.ts',
@@ -42,12 +51,12 @@ export default defineConfig({
       timeout: 60_000,
       env: {
         ...base,
-        NODE_ENV: 'test',
+        TEF_ENV: 'test',
         HOST: '127.0.0.1',
         PORT: String(API_PORT),
         LOG_LEVEL: 'warn',
         TEF_PERSISTENCE: 'postgres',
-        DATABASE_URL: required('E2E_DATABASE_URL'),
+        DATABASE_URL: required('E2E_APP_DATABASE_URL'), // tef_app
         TEF_PROVIDER: 'simulator',
         TEF_PROVIDER_TIMEOUT_MS: '1500',
         TEF_API_CREDENTIALS: required('E2E_API_CREDENTIALS'),
@@ -62,9 +71,9 @@ export default defineConfig({
       timeout: 60_000,
       env: {
         ...base,
-        NODE_ENV: 'test',
+        TEF_ENV: 'test',
         LOG_LEVEL: 'warn',
-        DATABASE_URL: required('E2E_DATABASE_URL'),
+        TEF_WORKER_DATABASE_URL: required('E2E_WORKER_DATABASE_URL'), // tef_worker
         TEF_PROVIDER: 'simulator',
         TEF_PROVIDER_TIMEOUT_MS: '1500',
         TEF_WORKER_ID: 'worker-e2e',

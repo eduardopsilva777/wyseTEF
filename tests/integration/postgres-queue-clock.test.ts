@@ -10,6 +10,10 @@ import { createTestSchema, quiesceQueue, TEST_DATABASE_URL, type TestSchema } fr
  * ADR 0019 — o relógio do PostgreSQL é a autoridade temporal da fila. Cada processo de
  * teste recebe um relógio próprio, artificialmente divergente (±1 h); o relógio do sistema
  * operacional não é alterado. As garantias valem com concorrência real no PostgreSQL.
+ *
+ * Identidades (ADR 0020): pagamentos são criados pela API (`db.uow`, tef_app); workers,
+ * reivindicações e o livro do simulador usam `db.workerUow`/`db.workerPool` (tef_worker).
+ * `db.pool` (superusuário) só inspeciona.
  */
 const HOUR = 3_600_000;
 const LEASE_MS = 600;
@@ -50,7 +54,7 @@ describe.skipIf(!TEST_DATABASE_URL)('PostgreSQL — relógio do banco na fila e 
 
   it('1. relógios divergentes: tarefa criada por processo adiantado fica disponível já para um worker atrasado', async () => {
     const api = testRuntime(db.uow, { workerId: 'api-adiantada', clock: skewed(+HOUR) });
-    const late = testRuntime(db.uow, { workerId: 'worker-atrasado', clock: skewed(-HOUR) });
+    const late = testRuntime(db.workerUow, { workerId: 'worker-atrasado', clock: skewed(-HOUR) });
     const created = await api.service.createPayment(ctxA, { ...createCommand(), authorize: true }, newKey());
 
     // available_at vem do banco, não do relógio (+1 h) de quem enfileirou.
@@ -67,10 +71,11 @@ describe.skipIf(!TEST_DATABASE_URL)('PostgreSQL — relógio do banco na fila e 
   });
 
   it('2. lease não é antecipado por um worker com relógio adiantado e vence pelo relógio do banco', async () => {
-    const owner = testRuntime(db.uow, { workerId: 'dono-atrasado', clock: skewed(-HOUR) });
-    const thief = testRuntime(db.uow, { workerId: 'intruso-adiantado', clock: skewed(+HOUR) });
-    const created = await owner.service.createPayment(ctxA, { ...createCommand(), authorize: true }, newKey());
-    const [job] = await db.uow.transaction((r) => r.jobs.claim('dono-atrasado', 10, LEASE_MS));
+    const api = testRuntime(db.uow, { clock: skewed(+HOUR) });
+    const owner = testRuntime(db.workerUow, { workerId: 'dono-atrasado', clock: skewed(-HOUR) });
+    const thief = testRuntime(db.workerUow, { workerId: 'intruso-adiantado', clock: skewed(+HOUR) });
+    const created = await api.service.createPayment(ctxA, { ...createCommand(), authorize: true }, newKey());
+    const [job] = await db.workerUow.transaction((r) => r.jobs.claim('dono-atrasado', 10, LEASE_MS));
     expect(job).toBeDefined();
 
     // O prazo concedido é medido pelo banco, independentemente do relógio (−1 h) do dono.
@@ -90,46 +95,48 @@ describe.skipIf(!TEST_DATABASE_URL)('PostgreSQL — relógio do banco na fila e 
   });
 
   it('3. renovação e conclusão respeitam a posse; lease vencido não é ressuscitado', async () => {
-    const rt = testRuntime(db.uow, { workerId: 'w-posse', clock: skewed(+HOUR) });
-    const created = await rt.service.createPayment(ctxA, { ...createCommand(), authorize: true }, newKey());
-    const [job] = await db.uow.transaction((r) => r.jobs.claim('dono', 10, LEASE_MS));
+    const api = testRuntime(db.uow, { clock: skewed(-HOUR) });
+    const rt = testRuntime(db.workerUow, { workerId: 'w-posse', clock: skewed(+HOUR) });
+    const created = await api.service.createPayment(ctxA, { ...createCommand(), authorize: true }, newKey());
+    const [job] = await db.workerUow.transaction((r) => r.jobs.claim('dono', 10, LEASE_MS));
     const id = job!.id;
 
     // Quem não é dono não renova, não conclui e não reagenda.
-    expect(await db.uow.transaction((r) => r.jobs.renewLease(id, 'outro', LEASE_MS))).toBe(false);
-    expect(await db.uow.transaction((r) => r.jobs.complete(id, 'outro'))).toBe(false);
-    expect(await db.uow.transaction((r) => r.jobs.retryLater(id, 'outro', 0, 'X'))).toBe('LOST_LEASE');
+    expect(await db.workerUow.transaction((r) => r.jobs.renewLease(id, 'outro', LEASE_MS))).toBe(false);
+    expect(await db.workerUow.transaction((r) => r.jobs.complete(id, 'outro'))).toBe(false);
+    expect(await db.workerUow.transaction((r) => r.jobs.retryLater(id, 'outro', 0, 'X'))).toBe('LOST_LEASE');
 
     // O dono renova dentro do prazo: novo prazo contado a partir do relógio do banco.
     await sleep(300);
-    expect(await db.uow.transaction((r) => r.jobs.renewLease(id, 'dono', LEASE_MS))).toBe(true);
+    expect(await db.workerUow.transaction((r) => r.jobs.renewLease(id, 'dono', LEASE_MS))).toBe(true);
     expect(await leaseRemainingMs(id)).toBeGreaterThan(LEASE_MS - 250);
 
     // Depois do vencimento, nem o antigo dono renova, conclui ou reagenda.
     await sleep(PAST_LEASE_MS);
-    expect(await db.uow.transaction((r) => r.jobs.renewLease(id, 'dono', LEASE_MS))).toBe(false);
-    expect(await db.uow.transaction((r) => r.jobs.complete(id, 'dono'))).toBe(false);
-    expect(await db.uow.transaction((r) => r.jobs.retryLater(id, 'dono', 0, 'X'))).toBe('LOST_LEASE');
+    expect(await db.workerUow.transaction((r) => r.jobs.renewLease(id, 'dono', LEASE_MS))).toBe(false);
+    expect(await db.workerUow.transaction((r) => r.jobs.complete(id, 'dono'))).toBe(false);
+    expect(await db.workerUow.transaction((r) => r.jobs.retryLater(id, 'dono', 0, 'X'))).toBe('LOST_LEASE');
 
     // Outro worker reassume; só ele conclui.
-    const [again] = await db.uow.transaction((r) => r.jobs.claim('sucessor', 10, LEASE_MS));
+    const [again] = await db.workerUow.transaction((r) => r.jobs.claim('sucessor', 10, LEASE_MS));
     expect(again).toMatchObject({ id, attempts: 2, leaseOwner: 'sucessor' });
     const outcome = await rt.service.processJob(again!, SYSTEM, { workerId: 'sucessor', leaseMs: LEASE_MS });
     expect(outcome).toMatchObject({ kind: 'DONE', detail: 'SUCCEEDED' });
-    expect(await db.uow.transaction((r) => r.jobs.complete(id, 'dono'))).toBe(false);
-    expect(await db.uow.transaction((r) => r.jobs.complete(id, 'sucessor'))).toBe(true);
+    expect(await db.workerUow.transaction((r) => r.jobs.complete(id, 'dono'))).toBe(false);
+    expect(await db.workerUow.transaction((r) => r.jobs.complete(id, 'sucessor'))).toBe(true);
     expect(await count(ctxA.tenantId, created.operations[0]!.id, 'operation.dispatched')).toBe(1);
   });
 
   it('4. worker que parou de renovar após o envio: recuperação marca UNKNOWN e NÃO reenvia', async () => {
-    const recoverer = testRuntime(db.uow, { workerId: 'recuperador-atrasado', clock: skewed(-HOUR) });
-    const sweeper = testRuntime(db.uow, { workerId: 'varredor-adiantado', clock: skewed(+HOUR) });
-    const created = await recoverer.service.createPayment(ctxA, { ...createCommand(), authorize: true }, newKey());
+    const api = testRuntime(db.uow, { clock: skewed(+HOUR) });
+    const recoverer = testRuntime(db.workerUow, { workerId: 'recuperador-atrasado', clock: skewed(-HOUR) });
+    const sweeper = testRuntime(db.workerUow, { workerId: 'varredor-adiantado', clock: skewed(+HOUR) });
+    const created = await api.service.createPayment(ctxA, { ...createCommand(), authorize: true }, newKey());
     const opId = created.operations[0]!.id;
 
     // O worker original reivindica, marca IN_FLIGHT (possível envio) e para de renovar.
-    await db.uow.transaction((r) => r.jobs.claim('original-parado', 10, LEASE_MS));
-    await db.uow.transaction(async (r) => {
+    await db.workerUow.transaction((r) => r.jobs.claim('original-parado', 10, LEASE_MS));
+    await db.workerUow.transaction(async (r) => {
       const op = await r.operations.findById(ctxA.tenantId, opId);
       await r.operations.update(markDispatched(op!, recoverer.simulator.capabilities, new Date()), op!.version);
     });
@@ -151,18 +158,19 @@ describe.skipIf(!TEST_DATABASE_URL)('PostgreSQL — relógio do banco na fila e 
     expect(recoverer.simulator.receivedCount() + sweeper.simulator.receivedCount()).toBe(0);
     expect(await count(ctxA.tenantId, opId, 'operation.dispatched')).toBe(0);
     // O que fica agendado é CONSULTA, nunca nova execução.
-    const jobs = await db.uow.transaction((r) => r.jobs.listByPayment(ctxA.tenantId, created.payment.id));
+    const jobs = await db.workerUow.transaction((r) => r.jobs.listByPayment(ctxA.tenantId, created.payment.id));
     expect(jobs.map((j) => `${j.kind}:${j.status}`)).toEqual(['EXECUTE_OPERATION:DONE', 'RECONCILE_OPERATION:PENDING']);
   });
 
   it('5. corrida entre recuperação e resposta original: um único envio e estado coerente', async () => {
-    const ledger = createPgSimulatorLedger(db.pool);
+    const ledger = createPgSimulatorLedger(db.workerPool);
     // Dono lento: a resposta do provedor chega (1,5 s) depois do lease vencer (0,6 s).
-    const slow = testRuntime(db.uow, { workerId: 'dono-lento', clock: skewed(-HOUR), providerTimeoutMs: 2_500, simulatorDelayMs: 1_500, ledger });
-    const recoverer = testRuntime(db.uow, { workerId: 'recuperador', clock: skewed(+HOUR), ledger });
-    const created = await slow.service.createPayment(ctxA, { ...createCommand(), authorize: true, testDirective: 'DELAYED_RESPONSE' }, newKey());
+    const api = testRuntime(db.uow, { clock: skewed(+HOUR) });
+    const slow = testRuntime(db.workerUow, { workerId: 'dono-lento', clock: skewed(-HOUR), providerTimeoutMs: 2_500, simulatorDelayMs: 1_500, ledger });
+    const recoverer = testRuntime(db.workerUow, { workerId: 'recuperador', clock: skewed(+HOUR), ledger });
+    const created = await api.service.createPayment(ctxA, { ...createCommand(), authorize: true, testDirective: 'DELAYED_RESPONSE' }, newKey());
     const opId = created.operations[0]!.id;
-    const [job] = await db.uow.transaction((r) => r.jobs.claim('dono-lento', 10, LEASE_MS));
+    const [job] = await db.workerUow.transaction((r) => r.jobs.claim('dono-lento', 10, LEASE_MS));
 
     const original = slow.service.processJob(job!, SYSTEM, { workerId: 'dono-lento', leaseMs: LEASE_MS });
     await sleep(900); // lease vencido; resposta original ainda pendente
@@ -181,28 +189,29 @@ describe.skipIf(!TEST_DATABASE_URL)('PostgreSQL — relógio do banco na fila e 
     expect(slow.simulator.receivedCount() + recoverer.simulator.receivedCount()).toBe(1);
     expect(await count(ctxA.tenantId, opId, 'operation.dispatched')).toBe(1);
     // O dono lento perdeu a posse: não conclui a tarefa.
-    expect(await db.uow.transaction((r) => r.jobs.complete(job!.id, 'dono-lento'))).toBe(false);
+    expect(await db.workerUow.transaction((r) => r.jobs.complete(job!.id, 'dono-lento'))).toBe(false);
     expect(verifyAuditChain(await loadAuditChain(db.pool, ctxA.tenantId)).valid).toBe(true);
     slow.simulator.dispose();
     recoverer.simulator.dispose();
   });
 
   it('6. UNKNOWN: tarefa de consulta expirada é recuperada por outro worker, sem reenvio da cobrança', async () => {
-    const ledger = createPgSimulatorLedger(db.pool);
-    const first = testRuntime(db.uow, { workerId: 'primeiro', clock: skewed(+HOUR), ledger });
-    const created = await first.service.createPayment(ctxA, { ...createCommand(), authorize: true, testDirective: 'TIMEOUT_AFTER_SEND' }, newKey());
+    const ledger = createPgSimulatorLedger(db.workerPool);
+    const api = testRuntime(db.uow, { clock: skewed(-HOUR) });
+    const first = testRuntime(db.workerUow, { workerId: 'primeiro', clock: skewed(+HOUR), ledger });
+    const created = await api.service.createPayment(ctxA, { ...createCommand(), authorize: true, testDirective: 'TIMEOUT_AFTER_SEND' }, newKey());
     const opId = created.operations[0]!.id;
     await first.worker.runOnce();
     expect((await first.service.getPayment(ctxA, created.payment.id)).payment.state).toBe('UNKNOWN');
 
     // Um worker reivindica a CONSULTA e morre sem renovar.
     await sleep(2 * TEST_RECONCILE_DELAY_MS);
-    const [reconcile] = await db.uow.transaction((r) => r.jobs.claim('consulta-morta', 10, LEASE_MS));
+    const [reconcile] = await db.workerUow.transaction((r) => r.jobs.claim('consulta-morta', 10, LEASE_MS));
     expect(reconcile).toMatchObject({ kind: 'RECONCILE_OPERATION', operationId: opId });
     await sleep(PAST_LEASE_MS);
 
     // Outro worker, com relógio atrasado, recupera a tarefa vencida e resolve por consulta.
-    const second = testRuntime(db.uow, { workerId: 'segundo-atrasado', clock: skewed(-HOUR), ledger });
+    const second = testRuntime(db.workerUow, { workerId: 'segundo-atrasado', clock: skewed(-HOUR), ledger });
     expect((await second.worker.runOnce()).jobs).toBe(1);
     const view = await second.service.getPayment(ctxA, created.payment.id);
     expect(view.payment.state).toBe('APPROVED');

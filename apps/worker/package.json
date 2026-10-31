@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@tef/application": "0.0.0",
+    "@tef/config": "0.0.0",
     "@tef/domain": "0.0.0",
     "@tef/observability": "0.0.0",
     "@tef/persistence": "0.0.0",

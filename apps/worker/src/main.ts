@@ -1,5 +1,5 @@
 import { createLogger } from '@tef/observability';
-import { createPgPool, createPgSimulatorLedger, PgUnitOfWork } from '@tef/persistence/postgres';
+import { createPgPool, createPgSimulatorLedger, DB_ROLES, inspectRuntimeIdentity, PgUnitOfWork } from '@tef/persistence/postgres';
 import { loadWorkerConfig, WorkerConfigError } from './config.ts';
 import { createWorkerRuntime, startHealthServer } from './runtime.ts';
 
@@ -12,9 +12,22 @@ try {
 }
 
 const logger = createLogger(config.LOG_LEVEL, config.NODE_ENV === 'production', undefined, 'tef-worker');
-const pool = createPgPool({ connectionString: config.DATABASE_URL, max: config.TEF_WORKER_BATCH + 4 });
+const pool = createPgPool({ connectionString: config.databaseUrl, max: config.TEF_WORKER_BATCH + 4 });
 pool.on('error', (error) => logger.error({ err: error }, 'erro em conexão ociosa do PostgreSQL'));
 const uow = new PgUnitOfWork(pool);
+logger.info({ tefEnv: config.env.env }, 'perfil de ambiente');
+// Identidade restrita (ADR 0020): o worker usa tef_worker, nunca o dono do schema ou um superusuário.
+if (config.env.identityCheck !== 'off') {
+  const report = await inspectRuntimeIdentity(pool, DB_ROLES.worker).catch(() => ({ user: 'desconhecido', violations: ['não foi possível verificar a identidade de banco'] }));
+  if (report.violations.length > 0) {
+    if (config.env.identityCheck === 'enforce') {
+      logger.fatal({ tefEnv: config.env.env, violations: report.violations }, 'identidade de banco do worker recusada');
+      await pool.end();
+      process.exit(1);
+    }
+    logger.warn({ tefEnv: config.env.env, violations: report.violations }, 'identidade de banco do worker não é a restrita (tef_worker): rode npm run dev:setup e npm run db:bootstrap');
+  }
+}
 
 const { worker, simulator } = createWorkerRuntime({
   uow,

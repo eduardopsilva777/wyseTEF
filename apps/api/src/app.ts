@@ -11,6 +11,7 @@ import {
   type PaymentId,
 } from '@tef/domain';
 import type { ProviderRegistry } from '@tef/provider-contract';
+import type { CookiePolicy } from '@tef/config';
 import type { DevAdminAuth } from './admin-auth.ts';
 import { registerAdminRoutes } from './admin-routes.ts';
 import type { Principal } from './auth.ts';
@@ -28,6 +29,8 @@ export interface AppDeps {
     readonly auth: DevAdminAuth;
     readonly service: AdminService;
     readonly allowedOrigins: readonly string[];
+    /** Política do cookie de sessão conforme o perfil; padrão: dev. */
+    readonly cookie?: CookiePolicy;
   };
 }
 
@@ -226,6 +229,7 @@ export function buildApp(deps: AppDeps): FastifyInstance {
       payments: deps.service,
       providers: deps.providers,
       allowedOrigins: deps.admin.allowedOrigins,
+      ...(deps.admin.cookie ? { cookie: deps.admin.cookie } : {}),
     });
   }
 

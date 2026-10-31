@@ -26,7 +26,7 @@ describe('painel web: ausência de segredos e exposição local', () => {
   it('não referencia credenciais nem variáveis sensíveis do servidor', () => {
     for (const f of files) {
       const content = readFileSync(f, 'utf8');
-      expect(content, f).not.toMatch(/TEF_DEV_ADMIN_TOKEN_SHA256|TEF_API_CREDENTIALS|DATABASE_URL|POSTGRES_PASSWORD|keySha256/);
+      expect(content, f).not.toMatch(/TEF_DEV_ADMIN_TOKEN_SHA256|TEF_API_CREDENTIALS|DATABASE_URL|TEF_DB_ADMIN_URL|POSTGRES_PASSWORD|keySha256/);
       expect(content, f).not.toMatch(/sessionStorage|document\.cookie|indexedDB/);
       // Único uso permitido de armazenamento local: a preferência de tema (sem dados de negócio).
       if (!f.endsWith('theme.ts')) expect(content, f).not.toMatch(/localStorage/);

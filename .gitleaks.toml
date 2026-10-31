@@ -1,0 +1,7 @@
+# Configuração do Gitleaks (CI e uso local). Usa as regras padrão do Gitleaks, sem
+# exceções: os testes montam valores fictícios em tempo de execução, então nenhum
+# segredo — real ou de teste — precisa existir no repositório nem em allowlist.
+title = "tef-platform"
+
+[extend]
+useDefault = true

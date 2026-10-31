@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import type { CookiePolicy } from '@tef/config';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { isValidIdempotencyKey, type Actor, type AdminService, type PaymentService } from '@tef/application';
@@ -20,8 +21,8 @@ import type { ProviderRegistry } from '@tef/provider-contract';
 import { SIMULATOR_DIRECTIVES } from '@tef/provider-simulator';
 import {
   ADMIN_CSRF_HEADER,
-  ADMIN_SESSION_COOKIE,
   clearedSessionCookie,
+  DEV_COOKIE_POLICY,
   readCookie,
   sessionCookie,
   type AdminSession,
@@ -47,6 +48,8 @@ export interface AdminRouteDeps {
   readonly providers: ProviderRegistry;
   /** Origens aceitas no cabeçalho Origin (o painel local). */
   readonly allowedOrigins: readonly string[];
+  /** Política do cookie de sessão (derivada do perfil de ambiente); padrão: dev. */
+  readonly cookie?: CookiePolicy;
 }
 
 declare module 'fastify' {
@@ -115,6 +118,7 @@ function idempotencyKey(request: FastifyRequest): string {
  */
 export function registerAdminRoutes(app: FastifyInstance, deps: AdminRouteDeps): void {
   app.decorateRequest('adminSession', null);
+  const cookie = deps.cookie ?? DEV_COOKIE_POLICY;
 
   void app.register(
     (scope, _opts, done) => {
@@ -129,7 +133,7 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AdminRouteDeps):
           return;
         }
         const isLogin = request.method === 'POST' && request.url.split('?')[0] === '/admin/api/session';
-        request.adminSession = deps.auth.verify(readCookie(request.headers.cookie, ADMIN_SESSION_COOKIE));
+        request.adminSession = deps.auth.verify(readCookie(request.headers.cookie, cookie.name));
         if (!isLogin && !request.adminSession) {
           next(new HttpError(401, 'ADMIN_UNAUTHENTICATED', 'sessão administrativa ausente ou expirada'));
           return;
@@ -148,7 +152,7 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AdminRouteDeps):
         if (!result) throw new HttpError(401, 'ADMIN_UNAUTHENTICATED', 'token inválido');
         request.log.info({ operatorId: result.session.operatorId }, 'sessão administrativa local iniciada');
         return reply
-          .header('set-cookie', sessionCookie(result.sessionId, deps.auth.ttlSeconds))
+          .header('set-cookie', sessionCookie(result.sessionId, deps.auth.ttlSeconds, cookie))
           .send({ authenticated: true, operatorId: result.session.operatorId, mode: 'DEV_LOCAL_ADMIN', expiresAt: new Date(result.session.expiresAt).toISOString() });
       });
 
@@ -160,8 +164,8 @@ export function registerAdminRoutes(app: FastifyInstance, deps: AdminRouteDeps):
       }));
 
       scope.delete('/session', async (request, reply) => {
-        deps.auth.logout(readCookie(request.headers.cookie, ADMIN_SESSION_COOKIE));
-        return reply.header('set-cookie', clearedSessionCookie()).status(204).send();
+        deps.auth.logout(readCookie(request.headers.cookie, cookie.name));
+        return reply.header('set-cookie', clearedSessionCookie(cookie)).status(204).send();
       });
 
       // ------------------------------------------------------------- leituras

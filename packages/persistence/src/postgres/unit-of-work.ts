@@ -8,6 +8,12 @@ export interface PgPoolOptions {
   /** Apenas para testes: isola as tabelas em um schema próprio. */
   readonly searchPath?: string;
   readonly statementTimeoutMs?: number;
+  /**
+   * Papel assumido logo na conexão (`SET ROLE`), para quando o login é um MEMBRO do papel
+   * (ex.: um DBA membro de tef_owner executando migrações: os objetos criados ficam com
+   * tef_owner). O login precisa ser membro do papel; o servidor recusa caso contrário.
+   */
+  readonly role?: string;
 }
 
 const SCHEMA_NAME = /^[a-z_][a-z0-9_]{0,62}$/;
@@ -16,9 +22,13 @@ export function createPgPool(options: PgPoolOptions): pg.Pool {
   if (options.searchPath !== undefined && !SCHEMA_NAME.test(options.searchPath)) {
     throw new Error('nome de schema inválido');
   }
+  if (options.role !== undefined && !SCHEMA_NAME.test(options.role)) {
+    throw new Error('nome de papel inválido');
+  }
   const settings = [
     `-c statement_timeout=${options.statementTimeoutMs ?? 10_000}`,
     ...(options.searchPath ? [`-c search_path=${options.searchPath}`] : []),
+    ...(options.role ? [`-c role=${options.role}`] : []),
   ];
   return new pg.Pool({
     connectionString: options.connectionString,

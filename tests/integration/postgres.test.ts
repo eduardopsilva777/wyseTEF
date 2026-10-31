@@ -1,55 +1,65 @@
-import { randomBytes } from 'node:crypto';
 import type pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { verifyAuditChain } from '@tef/audit';
-import { createPgPool, createPgRepositories, loadAuditChain, migrate, PgUnitOfWork } from '@tef/persistence/postgres';
+import { createPgRepositories, loadAuditChain, migrate, type PgUnitOfWork } from '@tef/persistence/postgres';
 import { createCommand, createHarness, ctxA, newKey, TENANT_A, TENANT_B } from '../support/harness.ts';
 import { seedCatalog } from '../support/catalog.ts';
+import { createTestSchema, type TestSchema } from '../support/pg.ts';
 import { describePaymentServiceSuite } from '../support/service-suite.ts';
 
 /**
  * Testes de integração com PostgreSQL REAL. Sem TEST_DATABASE_URL, são pulados
  * (e o resumo do Vitest mostra "skipped"); `npm run test:db` os torna obrigatórios.
  * Cada execução usa um schema próprio, removido ao final.
+ *
+ * Identidades (ADR 0020): migrações como tef_owner; o código do produto roda com logins
+ * membros de tef_app/tef_worker (`uow`, `app`); `pool` é o superusuário de teste, usado
+ * SÓ para atacar as restrições do esquema diretamente (gatilhos, CHECKs, índices).
  */
 const url = process.env['TEST_DATABASE_URL'];
 const required = process.env['TEST_DATABASE_REQUIRED'] === '1';
 
 if (required && !url) throw new Error('TEST_DATABASE_REQUIRED=1, mas TEST_DATABASE_URL não está definido');
 
-const schema = `it_${randomBytes(6).toString('hex')}`;
-let admin: pg.Pool;
+let db: TestSchema;
 let pool: pg.Pool;
+let app: pg.Pool;
 let uow: PgUnitOfWork;
+
+const MIGRATIONS = [
+  '0001_initial_schema.sql',
+  '0002_catalog_jobs_outbox.sql',
+  '0003_simulator_ledger.sql',
+  '0004_simulator_ledger_scope.sql',
+  '0005_runtime_role_privileges.sql',
+] as const;
 
 describe.skipIf(!url)('PostgreSQL', () => {
   beforeAll(async () => {
-    admin = createPgPool({ connectionString: url!, max: 1 });
-    await admin.query(`CREATE SCHEMA ${schema}`); // nome gerado localmente e validado pelo padrão do createPgPool
-    pool = createPgPool({ connectionString: url!, searchPath: schema, max: 10 });
-    uow = new PgUnitOfWork(pool);
-    const result = await migrate(pool);
-    expect(result.applied).toEqual(['0001_initial_schema.sql', '0002_catalog_jobs_outbox.sql', '0003_simulator_ledger.sql', '0004_simulator_ledger_scope.sql']);
-    await seedCatalog(uow);
+    db = await createTestSchema({ migrate: false });
+    pool = db.pool;
+    app = db.appPool;
+    uow = db.serviceUow;
+    const result = await migrate(db.ownerPool);
+    expect(result.applied).toEqual([...MIGRATIONS]);
+    await seedCatalog(db.uow);
   });
 
   afterAll(async () => {
-    await pool?.end();
-    await admin?.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
-    await admin?.end();
+    await db?.cleanup();
   });
 
   describe('migrações', () => {
     it('são idempotentes', async () => {
-      const again = await migrate(pool);
+      const again = await migrate(db.ownerPool);
       expect(again.applied).toEqual([]);
-      expect(again.alreadyApplied).toEqual(['0001_initial_schema.sql', '0002_catalog_jobs_outbox.sql', '0003_simulator_ledger.sql', '0004_simulator_ledger_scope.sql']);
+      expect(again.alreadyApplied).toEqual([...MIGRATIONS]);
     });
 
     it('detectam migração alterada depois de aplicada', async () => {
       const original = await pool.query<{ checksum: string }>(`SELECT checksum FROM schema_migrations WHERE version = $1`, ['0001_initial_schema.sql']);
       await pool.query(`UPDATE schema_migrations SET checksum = $1 WHERE version = $2`, ['f'.repeat(64), '0001_initial_schema.sql']);
-      await expect(migrate(pool)).rejects.toThrow(/foi alterada/);
+      await expect(migrate(db.ownerPool)).rejects.toThrow(/foi alterada/);
       await pool.query(`UPDATE schema_migrations SET checksum = $1 WHERE version = $2`, [original.rows[0]!.checksum, '0001_initial_schema.sql']);
     });
   });
@@ -112,14 +122,14 @@ describe.skipIf(!url)('PostgreSQL', () => {
 
     it('consultas parametrizadas: entrada maliciosa não altera a consulta', async () => {
       const { payment } = await approvedPayment();
-      const repos = createPgRepositories(pool);
+      const repos = createPgRepositories(app);
       expect(await repos.payments.findById(TENANT_A, `${payment.id}' OR '1'='1` as never)).toBeNull();
       expect(await repos.payments.findById(`${TENANT_A}' OR '1'='1` as never, payment.id)).toBeNull();
     });
 
     it('isolamento por tenant na camada SQL', async () => {
       const { payment } = await approvedPayment();
-      const repos = createPgRepositories(pool);
+      const repos = createPgRepositories(app);
       expect(await repos.payments.findById(TENANT_B, payment.id)).toBeNull();
       expect(await repos.operations.listByPayment(TENANT_B, payment.id)).toEqual([]);
     });
@@ -129,15 +139,12 @@ describe.skipIf(!url)('PostgreSQL', () => {
       h.scenario = { type: 'TIMEOUT_AFTER_SEND', hiddenOutcome: 'SUCCEEDED' };
       const { payment } = await h.service.createPayment(ctxA, createCommand(), newKey());
       await h.service.authorize(ctxA, payment.id, newKey());
-      const otherPool = createPgPool({ connectionString: url!, searchPath: schema, max: 1 });
-      try {
-        const repos = createPgRepositories(otherPool);
-        expect((await repos.payments.findById(TENANT_A, payment.id))?.state).toBe('UNKNOWN');
-        const [op] = await repos.operations.listByPayment(TENANT_A, payment.id);
-        expect(op?.status).toBe('UNKNOWN');
-      } finally {
-        await otherPool.end();
-      }
+      // Outra instância (o worker, com sua própria identidade) lê o mesmo estado.
+      const otherPool = db.connectAs('worker', { max: 1 });
+      const repos = createPgRepositories(otherPool);
+      expect((await repos.payments.findById(TENANT_A, payment.id))?.state).toBe('UNKNOWN');
+      const [op] = await repos.operations.listByPayment(TENANT_A, payment.id);
+      expect(op?.status).toBe('UNKNOWN');
     });
 
     it('concorrência alta: 30 criações com a mesma chave e 30 autorizações geram um pagamento e um envio', async () => {

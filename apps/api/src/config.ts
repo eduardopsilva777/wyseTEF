@@ -1,3 +1,4 @@
+import { checkDatabaseUrl, EnvironmentError, resolveEnvironment, type EnvironmentPolicy } from '@tef/config';
 import { z } from 'zod';
 
 /**
@@ -17,9 +18,15 @@ export type ApiCredential = z.infer<typeof credentialSchema>;
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
 const LOCAL_ORIGIN = /^http:\/\/(127\.0\.0\.1|localhost|\[::1\]):\d{2,5}$/;
 
-const envSchema = z
+/** keyId gerado pelo dev:setup e convenção para credenciais de desenvolvimento. */
+const DEV_KEY_ID = /^dev[-_]/i;
+const VERBOSE_LEVELS = new Set(['debug', 'trace']);
+
+const buildSchema = (policy: EnvironmentPolicy) =>
+  z
   .object({
-    NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+    TEF_ENV: z.enum(['dev', 'test', 'staging', 'prod']).optional(),
+    NODE_ENV: z.enum(['development', 'test', 'production']).optional(),
     HOST: z.string().min(1).default('127.0.0.1'),
     PORT: z.coerce.number().int().min(1).max(65535).default(3000),
     LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
@@ -53,16 +60,24 @@ const envSchema = z
     if (env.TEF_PERSISTENCE === 'postgres' && !env.DATABASE_URL) {
       ctx.addIssue({ code: 'custom', path: ['DATABASE_URL'], message: 'obrigatório com TEF_PERSISTENCE=postgres' });
     }
-    if (env.NODE_ENV === 'production') {
-      if (env.TEF_PERSISTENCE === 'memory') {
-        ctx.addIssue({ code: 'custom', path: ['TEF_PERSISTENCE'], message: 'memória não é permitida em produção' });
-      }
-      if (env.TEF_DEV_ADMIN_TOKEN_SHA256) {
-        ctx.addIssue({ code: 'custom', path: ['TEF_DEV_ADMIN_TOKEN_SHA256'], message: 'o acesso administrativo local não é permitido em produção' });
-      }
-      if (env.TEF_PROVIDER === 'simulator') {
-        ctx.addIssue({ code: 'custom', path: ['TEF_PROVIDER'], message: 'o simulador não é permitido em produção' });
-      }
+    const where = policy.env === 'prod' ? 'produção' : policy.env;
+    if (env.TEF_PERSISTENCE === 'memory' && !policy.allowMemoryPersistence) {
+      ctx.addIssue({ code: 'custom', path: ['TEF_PERSISTENCE'], message: `memória não é permitida em ${where}` });
+    }
+    if (env.TEF_DEV_ADMIN_TOKEN_SHA256 && !policy.allowDevAdminToken) {
+      ctx.addIssue({ code: 'custom', path: ['TEF_DEV_ADMIN_TOKEN_SHA256'], message: `o acesso administrativo local não é permitido em ${where}` });
+    }
+    if (env.TEF_PROVIDER === 'simulator' && !policy.allowSimulator) {
+      ctx.addIssue({ code: 'custom', path: ['TEF_PROVIDER'], message: `o simulador não é permitido em ${where}` });
+    }
+    if (VERBOSE_LEVELS.has(env.LOG_LEVEL) && !policy.allowVerboseLogs) {
+      ctx.addIssue({ code: 'custom', path: ['LOG_LEVEL'], message: `debug/trace não são permitidos em ${where}` });
+    }
+    if (env.DATABASE_URL) {
+      for (const message of checkDatabaseUrl('DATABASE_URL', env.DATABASE_URL, policy)) ctx.addIssue({ code: 'custom', path: ['DATABASE_URL'], message });
+    }
+    if (!policy.allowDevCredentials && env.TEF_API_CREDENTIALS.some((c) => DEV_KEY_ID.test(c.keyId))) {
+      ctx.addIssue({ code: 'custom', path: ['TEF_API_CREDENTIALS'], message: `credencial de desenvolvimento (keyId dev-…) não é permitida em ${where}` });
     }
     // F1: sem autenticação definitiva nem limite de taxa, a API só escuta em loopback.
     if (!LOOPBACK_HOSTS.has(env.HOST)) {
@@ -79,7 +94,11 @@ const envSchema = z
     }
   });
 
-export type AppConfig = z.infer<typeof envSchema>;
+export type AppConfig = z.infer<ReturnType<typeof buildSchema>> & {
+  /** Perfil resolvido (TEF_ENV) e sua política. */
+  readonly env: EnvironmentPolicy;
+  readonly NODE_ENV: EnvironmentPolicy['nodeEnv'];
+};
 
 export class ConfigError extends Error {
   readonly issues: readonly string[];
@@ -92,10 +111,16 @@ export class ConfigError extends Error {
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
-  const parsed = envSchema.safeParse(env);
+  let policy: EnvironmentPolicy;
+  try {
+    policy = resolveEnvironment(env);
+  } catch (error) {
+    throw new ConfigError(error instanceof EnvironmentError ? error.issues : ['perfil de ambiente inválido']);
+  }
+  const parsed = buildSchema(policy).safeParse(env);
   if (!parsed.success) {
     // Apenas caminho e mensagem — nunca o valor recebido.
     throw new ConfigError(parsed.error.issues.map((i) => `${i.path.join('.') || '(raiz)'}: ${i.message}`));
   }
-  return parsed.data;
+  return { ...parsed.data, env: policy, NODE_ENV: policy.nodeEnv };
 }

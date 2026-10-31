@@ -11,6 +11,7 @@
   "dependencies": {
     "@tef/application": "0.0.0",
     "@tef/audit": "0.0.0",
+    "@tef/config": "0.0.0",
     "@tef/domain": "0.0.0",
     "@tef/provider-simulator": "0.0.0",
     "pg": "8.23.1"

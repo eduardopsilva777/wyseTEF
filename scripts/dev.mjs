@@ -9,6 +9,21 @@ if (!existsSync('.env')) {
 }
 process.loadEnvFile('.env'); // não sobrescreve variáveis já definidas no ambiente
 
+// Identidades de banco (ADR 0020): migrações como tef_owner, API como tef_app, worker como tef_worker.
+const userOf = (url) => {
+  try {
+    return decodeURIComponent(new URL(url ?? '').username);
+  } catch {
+    return '';
+  }
+};
+const expected = { TEF_OWNER_DATABASE_URL: 'tef_owner', DATABASE_URL: 'tef_app', TEF_WORKER_DATABASE_URL: 'tef_worker' };
+const wrong = Object.entries(expected).filter(([variable, role]) => userOf(process.env[variable]) !== role);
+if (wrong.length) {
+  console.error(`[dev] .env sem as identidades de banco da F2B (${wrong.map(([v]) => v).join(', ')}). Rode: npm run dev:setup`);
+  process.exit(1);
+}
+
 const step = (label, cmd, args) => {
   console.log(`[dev] ${label}`);
   // Sem shell: argumentos não são concatenados nem interpretados.
@@ -20,7 +35,8 @@ const step = (label, cmd, args) => {
 };
 
 step('PostgreSQL local (docker compose)', 'docker', ['compose', '-f', 'infra/dev/docker-compose.yml', '--env-file', '.env', 'up', '-d', '--wait']);
-step('migrações', process.execPath, ['packages/persistence/src/cli/migrate.ts']);
+step('papéis do PostgreSQL (bootstrap local, idempotente)', process.execPath, ['packages/persistence/src/cli/bootstrap.ts']);
+step('migrações (tef_owner)', process.execPath, ['packages/persistence/src/cli/migrate.ts']);
 
 const children = [];
 const start = (name, args, cwd = process.cwd()) => {

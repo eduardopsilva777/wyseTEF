@@ -1,14 +1,24 @@
 import { hostname } from 'node:os';
+import { checkDatabaseUrl, databaseUser, EnvironmentError, resolveEnvironment, type EnvironmentPolicy } from '@tef/config';
 import { z } from 'zod';
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
 
-/** Configuração do worker. O worker exige PostgreSQL: a fila precisa ser durável. */
-const envSchema = z
+const VERBOSE_LEVELS = new Set(['debug', 'trace']);
+
+/**
+ * Configuração do worker. O worker exige PostgreSQL: a fila precisa ser durável.
+ * Identidade de banco própria (`TEF_WORKER_DATABASE_URL`, papel tef_worker — ADR 0020);
+ * só em dev/test aceita, por compatibilidade, a `DATABASE_URL` da API.
+ */
+const buildSchema = (policy: EnvironmentPolicy) =>
+  z
   .object({
-    NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+    TEF_ENV: z.enum(['dev', 'test', 'staging', 'prod']).optional(),
+    NODE_ENV: z.enum(['development', 'test', 'production']).optional(),
     LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
-    DATABASE_URL: z.string().min(1),
+    TEF_WORKER_DATABASE_URL: z.string().min(1).optional(),
+    DATABASE_URL: z.string().min(1).optional(),
     TEF_PROVIDER: z.literal('simulator').default('simulator'),
     TEF_PROVIDER_TIMEOUT_MS: z.coerce.number().int().min(100).max(300_000).default(5_000),
     TEF_WORKER_ID: z.string().regex(/^[A-Za-z0-9_.:-]{1,64}$/).optional(),
@@ -21,8 +31,28 @@ const envSchema = z
     TEF_SIMULATOR_DELAY_MS: z.coerce.number().int().min(0).max(120_000).default(8_000),
   })
   .superRefine((env, ctx) => {
-    if (env.NODE_ENV === 'production' && env.TEF_PROVIDER === 'simulator') {
-      ctx.addIssue({ code: 'custom', path: ['TEF_PROVIDER'], message: 'o simulador não é permitido em produção' });
+    const where = policy.env === 'prod' ? 'produção' : policy.env;
+    if (env.TEF_PROVIDER === 'simulator' && !policy.allowSimulator) {
+      ctx.addIssue({ code: 'custom', path: ['TEF_PROVIDER'], message: `o simulador não é permitido em ${where}` });
+    }
+    if (VERBOSE_LEVELS.has(env.LOG_LEVEL) && !policy.allowVerboseLogs) {
+      ctx.addIssue({ code: 'custom', path: ['LOG_LEVEL'], message: `debug/trace não são permitidos em ${where}` });
+    }
+    const url = env.TEF_WORKER_DATABASE_URL ?? (policy.identityCheck === 'enforce' ? undefined : env.DATABASE_URL);
+    if (!url) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['TEF_WORKER_DATABASE_URL'],
+        message: policy.identityCheck === 'enforce' ? `obrigatório em ${where} (identidade tef_worker)` : 'obrigatório (ou DATABASE_URL em dev/test)',
+      });
+    } else {
+      for (const message of checkDatabaseUrl('TEF_WORKER_DATABASE_URL', url, policy)) ctx.addIssue({ code: 'custom', path: ['TEF_WORKER_DATABASE_URL'], message });
+    }
+    if (policy.identityCheck === 'enforce' && env.TEF_WORKER_DATABASE_URL && env.DATABASE_URL) {
+      const worker = databaseUser(env.TEF_WORKER_DATABASE_URL);
+      if (worker !== null && worker === databaseUser(env.DATABASE_URL)) {
+        ctx.addIssue({ code: 'custom', path: ['TEF_WORKER_DATABASE_URL'], message: 'o worker precisa de identidade de banco distinta da API' });
+      }
     }
     if (!LOOPBACK_HOSTS.has(env.TEF_WORKER_HEALTH_HOST)) {
       ctx.addIssue({ code: 'custom', path: ['TEF_WORKER_HEALTH_HOST'], message: 'o health check só pode escutar em loopback' });
@@ -32,7 +62,13 @@ const envSchema = z
     }
   });
 
-export type WorkerConfig = z.infer<typeof envSchema> & { readonly workerId: string };
+export type WorkerConfig = z.infer<ReturnType<typeof buildSchema>> & {
+  readonly workerId: string;
+  /** URL efetiva do PostgreSQL do worker. */
+  readonly databaseUrl: string;
+  readonly env: EnvironmentPolicy;
+  readonly NODE_ENV: EnvironmentPolicy['nodeEnv'];
+};
 
 export class WorkerConfigError extends Error {
   constructor(issues: readonly string[]) {
@@ -42,10 +78,17 @@ export class WorkerConfigError extends Error {
 }
 
 export function loadWorkerConfig(env: NodeJS.ProcessEnv): WorkerConfig {
-  const parsed = envSchema.safeParse(env);
+  let policy: EnvironmentPolicy;
+  try {
+    policy = resolveEnvironment(env);
+  } catch (error) {
+    throw new WorkerConfigError(error instanceof EnvironmentError ? error.issues : ['perfil de ambiente inválido']);
+  }
+  const parsed = buildSchema(policy).safeParse(env);
   if (!parsed.success) {
     throw new WorkerConfigError(parsed.error.issues.map((i) => `${i.path.join('.') || '(raiz)'}: ${i.message}`));
   }
   const fallbackId = `worker-${hostname().replace(/[^A-Za-z0-9_.:-]/g, '-').slice(0, 40)}-${process.pid}`;
-  return { ...parsed.data, workerId: parsed.data.TEF_WORKER_ID ?? fallbackId };
+  const databaseUrl = (parsed.data.TEF_WORKER_DATABASE_URL ?? parsed.data.DATABASE_URL)!;
+  return { ...parsed.data, workerId: parsed.data.TEF_WORKER_ID ?? fallbackId, databaseUrl, env: policy, NODE_ENV: policy.nodeEnv };
 }

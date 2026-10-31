@@ -31,9 +31,12 @@ describe.skipIf(!TEST_DATABASE_URL)('PostgreSQL — modelo assíncrono', () => {
   describeAsyncSuite({
     name: 'postgres',
     // O relógio da fila é o do banco; o relógio do teste só governa os fatos de negócio.
+    // Mesmo PaymentService para o lado da API e o do worker: login membro de tef_app e
+    // tef_worker (nunca dono nem superusuário). A separação por papel é provada em
+    // postgres-roles.test.ts e postgres-queue-clock.test.ts.
     uow: async () => {
       await quiesceQueue(db.pool);
-      return db.uow;
+      return db.serviceUow;
     },
     advanceQueue: async (clock, ms) => {
       clock.ms += ms;
@@ -62,7 +65,7 @@ describe.skipIf(!TEST_DATABASE_URL)('PostgreSQL — modelo assíncrono', () => {
 
     it('três workers simultâneos: cada tarefa é executada uma única vez', async () => {
       const clock = { ms: Date.parse('2026-10-18T12:00:00.000Z') };
-      const workers = ['w1', 'w2', 'w3'].map((id) => testRuntime(db.uow, { workerId: `${id}-${Date.now()}`, clock }));
+      const workers = ['w1', 'w2', 'w3'].map((id) => testRuntime(db.serviceUow, { workerId: `${id}-${Date.now()}`, clock }));
       const ids: string[] = [];
       for (let i = 0; i < 12; i++) {
         const r = await workers[0]!.service.createPayment(ctxA, { ...createCommand(), authorize: true }, newKey());
@@ -85,10 +88,10 @@ describe.skipIf(!TEST_DATABASE_URL)('PostgreSQL — modelo assíncrono', () => {
     });
 
     it('dois publicadores simultâneos não entregam o mesmo evento duas vezes', async () => {
-      const rt = testRuntime(db.uow);
+      const rt = testRuntime(db.serviceUow);
       for (let i = 0; i < 5; i++) await rt.service.createPayment(ctxA, createCommand(), newKey());
       const sinks = [new RecordingSink(), new RecordingSink()];
-      const publishers = sinks.map((sink) => new OutboxPublisher({ uow: db.uow, sink, batchSize: 3 }));
+      const publishers = sinks.map((sink) => new OutboxPublisher({ uow: db.workerUow, sink, batchSize: 3 })); // tef_worker
       for (let round = 0; round < 10; round++) await Promise.all(publishers.map((p) => p.publishOnce()));
       const delivered = sinks.flatMap((s) => s.delivered.map((e) => e.id));
       expect(new Set(delivered).size).toBe(delivered.length);
@@ -96,16 +99,16 @@ describe.skipIf(!TEST_DATABASE_URL)('PostgreSQL — modelo assíncrono', () => {
     });
 
     it('reinício do worker: a reconciliação usa o livro durável do simulador e chega ao resultado real', async () => {
-      const ledger = createPgSimulatorLedger(db.pool);
+      const ledger = createPgSimulatorLedger(db.workerPool);
       const clock = { ms: Date.parse('2026-10-18T12:00:00.000Z') };
-      const before = testRuntime(db.uow, { workerId: 'w-antes', clock, ledger });
+      const before = testRuntime(db.serviceUow, { workerId: 'w-antes', clock, ledger });
       const created = await before.service.createPayment(ctxA, { ...createCommand(), authorize: true, testDirective: 'COMMUNICATION_FAILURE' }, newKey());
       await before.worker.runOnce();
       expect((await before.service.getPayment(ctxA, created.payment.id)).payment.state).toBe('UNKNOWN');
       before.simulator.dispose();
 
       // Novo processo (outra instância, memória vazia), mesmo banco.
-      const after = testRuntime(db.uow, { workerId: 'w-depois', clock, ledger: createPgSimulatorLedger(db.pool) });
+      const after = testRuntime(db.serviceUow, { workerId: 'w-depois', clock, ledger: createPgSimulatorLedger(db.workerPool) });
       // A consulta agendada vence pelo relógio do banco (ADR 0019): espera real, não só o relógio do teste.
       clock.ms += 3 * TEST_RECONCILE_DELAY_MS;
       await sleep(3 * TEST_RECONCILE_DELAY_MS);
@@ -120,7 +123,7 @@ describe.skipIf(!TEST_DATABASE_URL)('PostgreSQL — modelo assíncrono', () => {
     it('pagamento legado (anterior ao livro durável): reconciliação NÃO conclui "não enviado"; continua UNKNOWN', async () => {
       // Reproduz o pagamento legado da F1: processado por um simulador com livro em memória
       // (perdido), anterior ao início do livro durável.
-      const legacy = testRuntime(db.uow, { workerId: 'w-legado' }); // livro em memória, como na F1
+      const legacy = testRuntime(db.serviceUow, { workerId: 'w-legado' }); // livro em memória, como na F1
       const created = await legacy.service.createPayment(ctxA, { ...createCommand(), authorize: true, testDirective: 'UNKNOWN_THEN_RECONCILED' }, newKey());
       await legacy.worker.runOnce();
       expect((await legacy.service.getPayment(ctxA, created.payment.id)).payment.state).toBe('UNKNOWN');
@@ -129,7 +132,7 @@ describe.skipIf(!TEST_DATABASE_URL)('PostgreSQL — modelo assíncrono', () => {
       const original = await db.pool.query<{ started_at: Date }>('SELECT started_at FROM simulator_ledger_meta');
       await db.pool.query(`UPDATE simulator_ledger_meta SET started_at = now() + interval '1 day'`);
       try {
-        const current = testRuntime(db.uow, { workerId: 'w-atual', ledger: createPgSimulatorLedger(db.pool) });
+        const current = testRuntime(db.serviceUow, { workerId: 'w-atual', ledger: createPgSimulatorLedger(db.workerPool) });
         const result = await current.service.reconcileOperation(created.operations[0]!.id);
         expect(result.resolved).toBe(false);
         expect(result.payment.state).toBe('UNKNOWN'); // não vira CANCELLED por falta de registro
@@ -139,7 +142,7 @@ describe.skipIf(!TEST_DATABASE_URL)('PostgreSQL — modelo assíncrono', () => {
     });
 
     it('banco impede tarefa ativa duplicada para a mesma operação', async () => {
-      const rt = testRuntime(db.uow);
+      const rt = testRuntime(db.serviceUow);
       const created = await rt.service.createPayment(ctxA, { ...createCommand(), authorize: true }, newKey());
       const op = created.operations[0]!;
       const again = await db.uow.transaction((r) =>
@@ -170,7 +173,7 @@ describe.skipIf(!TEST_DATABASE_URL)('PostgreSQL — modelo assíncrono', () => {
     });
 
     it('não exclui cadastro com histórico financeiro; banco também impede (RESTRICT)', async () => {
-      const rt = testRuntime(db.uow);
+      const rt = testRuntime(db.serviceUow);
       await rt.service.createPayment(ctxA, createCommand(), newKey());
       await expect(admin().deleteTerminal(actor, ctxA.tenantId, parseTerminalId('terminal-1'))).rejects.toBeInstanceOf(HasDependenciesError);
       await expect(db.pool.query(`DELETE FROM terminals WHERE customer_id = 'tenant-a' AND id = 'terminal-1'`)).rejects.toMatchObject({ code: '23001' });
@@ -201,7 +204,7 @@ describe.skipIf(!TEST_DATABASE_URL)('PostgreSQL — modelo assíncrono', () => {
     });
 
     it('diretiva de teste só é aceita para o provedor SIMULATOR (restrição do banco)', async () => {
-      const rt = testRuntime(db.uow);
+      const rt = testRuntime(db.serviceUow);
       const created = await rt.service.createPayment(ctxA, createCommand(), newKey());
       await expect(
         db.pool.query(`INSERT INTO provider_test_directives (payment_id, provider_id, directive, created_at) VALUES ($1, 'REAL', 'APPROVE', now())`, [
@@ -220,7 +223,7 @@ describe.skipIf(!TEST_DATABASE_URL)('PostgreSQL — modelo assíncrono', () => {
       expect(empty.totals).toMatchObject({ payments: 0, approvalRate: null });
       expect(empty.daily.length).toBeGreaterThanOrEqual(14);
 
-      const rt = testRuntime(db.uow);
+      const rt = testRuntime(db.serviceUow);
       const ctx = { ...ctxA, tenantId: customer };
       const base = { merchantId: parseMerchantId('m1'), terminalId: parseTerminalId('t1') };
       await rt.service.createPayment(ctx, { ...createCommand(1_000), ...base, authorize: true, testDirective: 'APPROVE' }, newKey());
@@ -240,7 +243,7 @@ describe.skipIf(!TEST_DATABASE_URL)('PostgreSQL — modelo assíncrono', () => {
       const token = randomBytes(32).toString('base64url');
       const providers = createProviderRegistry([new PaymentSimulator()]);
       const logger = createLogger('silent', false);
-      const service = new PaymentService({ uow: db.uow, providers, providerTimeoutMs: 40, logger });
+      const service = new PaymentService({ uow: db.uow, providers, providerTimeoutMs: 40, logger }); // tef_app
       const app = buildApp({
         service,
         providers,
@@ -269,7 +272,7 @@ describe.skipIf(!TEST_DATABASE_URL)('PostgreSQL — modelo assíncrono', () => {
         const id = created.json<{ id: string }>().id;
 
         // Mesmo relógio real da API (os componentes reais compartilham o relógio da máquina).
-        const rt = testRuntime(db.uow, { clock: { ms: Date.now() }, ledger: createPgSimulatorLedger(db.pool) });
+        const rt = testRuntime(db.workerUow, { clock: { ms: Date.now() }, ledger: createPgSimulatorLedger(db.workerPool) }); // tef_worker
         await rt.worker.runOnce();
         const detail1 = await app.inject({ method: 'GET', url: `/admin/api/customers/tenant-a/payments/${id}`, headers: { ...headers, cookie } });
         expect(detail1.json()).toMatchObject({ payment: { state: 'UNKNOWN' }, testDirective: 'COMMUNICATION_FAILURE' });
