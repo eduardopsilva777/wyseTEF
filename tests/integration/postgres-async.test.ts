@@ -223,7 +223,7 @@ describe.skipIf(!TEST_DATABASE_URL)('PostgreSQL — modelo assíncrono', () => {
       expect(empty.totals).toMatchObject({ payments: 0, approvalRate: null });
       expect(empty.daily.length).toBeGreaterThanOrEqual(14);
 
-      const rt = testRuntime(db.serviceUow);
+      const rt = testRuntime(db.serviceUow, { clock: { ms: Date.now() } });
       const ctx = { ...ctxA, tenantId: customer };
       const base = { merchantId: parseMerchantId('m1'), terminalId: parseTerminalId('t1') };
       await rt.service.createPayment(ctx, { ...createCommand(1_000), ...base, authorize: true, testDirective: 'APPROVE' }, newKey());
